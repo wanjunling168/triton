@@ -1390,6 +1390,31 @@ def test_load_cache_modifier(cache):
         assert 'ld.global.cg' not in ptx
 
 
+def test_load_scalar_with_mask():
+    @triton.jit
+    def kernel(Input, Index, Out, N: int):
+        index = tl.load(Index)
+        scalar = tl.load(Input + index, mask=index < N, other=0)
+        tl.store(Out, scalar, mask=index < N)
+    Index = torch.tensor([0], dtype=torch.int32, device='cuda')
+    Input = torch.tensor([0], dtype=torch.int32, device='cuda')
+    Out = torch.empty_like(Index, device='cuda')
+    kernel[(1,)](Input, Index, Out, Index.numel())
+    assert Out.data[0] == 0
+
+
+def test_load_large_offset():
+    @triton.jit
+    def kernel(input, output, index):
+        val = tl.load(input + index * 1024)
+        tl.store(output, val)
+    # 2^32 * 2^1 = 2^33 = 8GB
+    input = torch.ones(2**32, dtype=torch.float16, device='cuda')
+    output = torch.tensor([0], dtype=torch.float16, device='cuda')
+    kernel[(1,)](input, output, 2**21)
+    assert output.data[0] == 1
+
+
 @pytest.mark.parametrize("N", [16, 10, 11, 1024])
 def test_vectorization(N):
     src = torch.empty(1024, device='cuda')
@@ -1952,16 +1977,3 @@ module attributes {"triton_gpu.num-warps" = 4 : i32} {
     kernel[(1, 1, 1)](x.data_ptr(), z.data_ptr())
 
     assert torch.equal(z, x)
-
-
-def test_load_scalar_with_mask():
-    @triton.jit
-    def kernel(Input, Index, Out, N: int):
-        index = tl.load(Index)
-        scalar = tl.load(Input + index, mask=index < N, other=0)
-        tl.store(Out, scalar, mask=index < N)
-    Index = torch.tensor([0], dtype=torch.int32, device='cuda')
-    Input = torch.tensor([0], dtype=torch.int32, device='cuda')
-    Out = torch.empty_like(Index, device='cuda')
-    kernel[(1,)](Input, Index, Out, Index.numel())
-    assert Out.data[0] == 0
