@@ -4,7 +4,6 @@
 // TODO: refactor so that it doesn't fail if Allocation.h
 // is included after utility.h (due to conflict in `store` macro
 // and <atomic>
-#include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "triton/Analysis/Allocation.h"
 
 //
@@ -40,15 +39,15 @@ void vprintf_array(Value thread, ArrayRef<Value> arr, std::string info,
 // TODO(Superjomn): remove the code when MLIR v15.0 is included.
 // All the rights are reserved by the LLVM community.
 
-struct FuncOpConversionBase : public ConvertOpToLLVMPattern<func::FuncOp> {
+struct FuncOpConversionBase : public ConvertOpToLLVMPattern<FuncOp> {
 private:
   /// Only retain those attributes that are not constructed by
   /// `LLVMFuncOp::build`. If `filterArgAttrs` is set, also filter out argument
   /// attributes.
-  static void filterFuncAttributes(func::FuncOp op, bool filterArgAttrs,
+  static void filterFuncAttributes(ArrayRef<NamedAttribute> attrs,
+                                   bool filterArgAttrs,
                                    SmallVectorImpl<NamedAttribute> &result) {
-
-    for (const auto &attr : op->getAttrs()) {
+    for (const auto &attr : attrs) {
       if (attr.getName() == SymbolTable::getSymbolAttrName() ||
           attr.getName() == FunctionOpInterface::getTypeAttrName() ||
           attr.getName() == "std.varargs" ||
@@ -66,27 +65,27 @@ private:
   }
 
 protected:
-  using ConvertOpToLLVMPattern<func::FuncOp>::ConvertOpToLLVMPattern;
+  using ConvertOpToLLVMPattern<FuncOp>::ConvertOpToLLVMPattern;
 
   // Convert input FuncOp to LLVMFuncOp by using the LLVMTypeConverter provided
   // to this legalization pattern.
   LLVM::LLVMFuncOp
-  convertFuncOpToLLVMFuncOp(func::FuncOp funcOp,
+  convertFuncOpToLLVMFuncOp(FuncOp funcOp,
                             ConversionPatternRewriter &rewriter) const {
     // Convert the original function arguments. They are converted using the
     // LLVMTypeConverter provided to this legalization pattern.
     auto varargsAttr = funcOp->getAttrOfType<BoolAttr>("func.varargs");
     TypeConverter::SignatureConversion result(funcOp.getNumArguments());
     auto llvmType = getTypeConverter()->convertFunctionSignature(
-        funcOp.getFunctionType(), varargsAttr && varargsAttr.getValue(),
-        result);
+        funcOp.getType(), varargsAttr && varargsAttr.getValue(), result);
     if (!llvmType)
       return nullptr;
 
     // Propagate argument/result attributes to all converted arguments/result
     // obtained after converting a given original argument/result.
     SmallVector<NamedAttribute, 4> attributes;
-    filterFuncAttributes(funcOp, /*filterArgAttrs=*/true, attributes);
+    filterFuncAttributes(funcOp->getAttrs(), /*filterArgAttrs=*/true,
+                         attributes);
     if (ArrayAttr resAttrDicts = funcOp.getAllResultAttrs()) {
       assert(!resAttrDicts.empty() && "expected array to be non-empty");
       auto newResAttrDicts =
@@ -132,7 +131,7 @@ protected:
     }
     auto newFuncOp = rewriter.create<LLVM::LLVMFuncOp>(
         funcOp.getLoc(), funcOp.getName(), llvmType, linkage,
-        /*dsoLocal*/ false, LLVM::CConv::C, attributes);
+        /*dsoLocal*/ false, attributes);
     rewriter.inlineRegionBefore(funcOp.getBody(), newFuncOp.getBody(),
                                 newFuncOp.end());
     if (failed(rewriter.convertRegionTypes(&newFuncOp.getBody(), *typeConverter,
@@ -192,8 +191,8 @@ public:
                                                const Allocation *allocation,
                                                Value smem,
                                                IndexCacheInfo indexCacheInfo)
-      : converter(&typeConverter), allocation(allocation), smem(smem),
-        indexCacheInfo(indexCacheInfo) {}
+      : converter(&typeConverter), indexCacheInfo(indexCacheInfo),
+        allocation(allocation), smem(smem) {}
 
   LLVMTypeConverter *getTypeConverter() const { return converter; }
 
@@ -862,6 +861,7 @@ private:
                             ArrayRef<int64_t> shape) const {
     auto parent = sliceLayout.getParent();
     unsigned dim = sliceLayout.getDim();
+    size_t rank = shape.size();
     auto parentIndices =
         emitIndices(loc, rewriter, parent, sliceLayout.paddedShape(shape));
     unsigned numIndices = parentIndices.size();

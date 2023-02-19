@@ -1,13 +1,13 @@
-#include "triton/Dialect/Triton/IR/Dialect.h"
-
 #include <numeric>
 
 #include "mlir/IR/DialectImplementation.h"
 #include "mlir/IR/OpImplementation.h"
 #include "triton/Analysis/Utility.h"
-#include "triton/Dialect/TritonGPU/IR/Dialect.cpp.inc"
+#include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "llvm/ADT/TypeSwitch.h"
+
+#include "triton/Dialect/TritonGPU/IR/Dialect.cpp.inc"
 
 using namespace mlir;
 using namespace mlir::triton::gpu;
@@ -366,6 +366,7 @@ template SmallVector<int64_t>
 SliceEncodingAttr::paddedShape<int64_t>(ArrayRef<int64_t> shape) const;
 
 unsigned SliceEncodingAttr::getElemsPerThread(ArrayRef<int64_t> shape) const {
+  size_t rank = shape.size();
   auto parent = getParent();
   return ::getElemsPerThread(parent, paddedShape(shape));
 }
@@ -654,9 +655,9 @@ void DotOperandEncodingAttr::print(mlir::AsmPrinter &printer) const {
 // InsertSliceAsyncOp
 //===----------------------------------------------------------------------===//
 
-ParseResult InsertSliceAsyncOp::parse(OpAsmParser &parser,
-                                      OperationState &result) {
-  SmallVector<OpAsmParser::UnresolvedOperand, 8> allOperands;
+ParseResult parseInsertSliceAsyncOp(OpAsmParser &parser,
+                                    OperationState &result) {
+  SmallVector<OpAsmParser::OperandType, 8> allOperands;
   Type srcType, dstType;
   SMLoc allOperandLoc = parser.getCurrentLocation();
   if (parser.parseOperandList(allOperands) ||
@@ -695,16 +696,18 @@ ParseResult InsertSliceAsyncOp::parse(OpAsmParser &parser,
   return success();
 }
 
-void InsertSliceAsyncOp::print(OpAsmPrinter &printer) {
+void printInsertSliceAsyncOp(OpAsmPrinter &printer,
+                             InsertSliceAsyncOp insertSliceAsyncOp) {
   printer << " ";
-  printer << getOperation()->getOperands();
+  printer << insertSliceAsyncOp.getOperation()->getOperands();
   // "operand_segment_sizes" can be deduced, so we don't print it.
-  printer.printOptionalAttrDict(getOperation()->getAttrs(),
-                                {operand_segment_sizesAttrName()});
+  printer.printOptionalAttrDict(
+      insertSliceAsyncOp->getAttrs(),
+      {insertSliceAsyncOp.operand_segment_sizesAttrName()});
   printer << " : ";
-  printer.printStrippedAttrOrType(src().getType());
+  printer.printStrippedAttrOrType(insertSliceAsyncOp.src().getType());
   printer << " -> ";
-  printer.printStrippedAttrOrType(result().getType());
+  printer.printStrippedAttrOrType(insertSliceAsyncOp.result().getType());
 }
 
 //===----------------------------------------------------------------------===//

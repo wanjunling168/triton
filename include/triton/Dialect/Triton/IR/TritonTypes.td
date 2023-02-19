@@ -1,7 +1,6 @@
 #ifndef TRITON_TYPES
 #define TRITON_TYPES
 
-include "mlir/IR/AttrTypeBase.td"
 include "triton/Dialect/Triton/IR/TritonDialect.td"
 
 //
@@ -59,7 +58,6 @@ def TT_Ptr : TritonTypeDef<"Pointer", "ptr"> {
         }]>
     ];
 
-    let hasCustomAssemblyFormat = 1;
     let skipDefaultBuilders = 1;
 }
 def TT_PtrTensor : TensorOf<[TT_Ptr]>;

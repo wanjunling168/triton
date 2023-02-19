@@ -1,4 +1,4 @@
-#include "mlir/Analysis/DataFlowFramework.h"
+#include "mlir/Analysis/DataFlowAnalysis.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "llvm/Support/raw_ostream.h"
 
@@ -52,7 +52,7 @@ AxisInfo AxisInfo::getPessimisticValueState(Value value) {
   BlockArgument blockArg = value.dyn_cast<BlockArgument>();
   if (blockArg && blockArg.getOwner()->isEntryBlock()) {
     Operation *op = blockArg.getOwner()->getParentOp();
-    if (func::FuncOp fun = dyn_cast<func::FuncOp>(op)) {
+    if (FuncOp fun = dyn_cast<FuncOp>(op)) {
       Attribute attr =
           fun.getArgAttr(blockArg.getArgNumber(), "tt.divisibility");
       if (attr)
@@ -136,9 +136,8 @@ class CastOpAxisInfoVisitor final : public AxisInfoVisitorImpl<OpTy> {
 public:
   using AxisInfoVisitorImpl<OpTy>::AxisInfoVisitorImpl;
 
-  AxisInfo
-  getAxisInfo(OpTy op,
-              ArrayRef<const dataflow::Lattice<AxisInfo> *> operands) override {
+  AxisInfo getAxisInfo(OpTy op,
+                       ArrayRef<LatticeElement<AxisInfo> *> operands) override {
     return operands[0]->getValue();
   }
 };
@@ -148,9 +147,8 @@ class MakeRangeOpAxisInfoVisitor final
 public:
   using AxisInfoVisitorImpl<triton::MakeRangeOp>::AxisInfoVisitorImpl;
 
-  AxisInfo
-  getAxisInfo(triton::MakeRangeOp op,
-              ArrayRef<const dataflow::Lattice<AxisInfo> *> operands) override {
+  AxisInfo getAxisInfo(triton::MakeRangeOp op,
+                       ArrayRef<LatticeElement<AxisInfo> *> operands) override {
     auto start = op.start();
     auto end = op.end();
     return AxisInfo(/*contiguity=*/{end - start},
@@ -164,9 +162,8 @@ class ConstantOpAxisInfoVisitor final
 public:
   using AxisInfoVisitorImpl<arith::ConstantOp>::AxisInfoVisitorImpl;
 
-  AxisInfo
-  getAxisInfo(arith::ConstantOp op,
-              ArrayRef<const dataflow::Lattice<AxisInfo> *> operands) override {
+  AxisInfo getAxisInfo(arith::ConstantOp op,
+                       ArrayRef<LatticeElement<AxisInfo> *> operands) override {
     auto intAttr = op.getValue().dyn_cast<IntegerAttr>();
     auto boolAttr = op.getValue().dyn_cast<BoolAttr>();
     if (intAttr || boolAttr) {
@@ -419,9 +416,8 @@ class SplatOpAxisInfoVisitor final
 public:
   using AxisInfoVisitorImpl<triton::SplatOp>::AxisInfoVisitorImpl;
 
-  AxisInfo
-  getAxisInfo(triton::SplatOp op,
-              ArrayRef<const dataflow::Lattice<AxisInfo> *> operands) override {
+  AxisInfo getAxisInfo(triton::SplatOp op,
+                       ArrayRef<LatticeElement<AxisInfo> *> operands) override {
     Type _retTy = *op->result_type_begin();
     TensorType retTy = _retTy.cast<TensorType>();
     AxisInfo opInfo = operands[0]->getValue();
@@ -443,9 +439,8 @@ class ExpandDimsOpAxisInfoVisitor final
 public:
   using AxisInfoVisitorImpl<triton::ExpandDimsOp>::AxisInfoVisitorImpl;
 
-  AxisInfo
-  getAxisInfo(triton::ExpandDimsOp op,
-              ArrayRef<const dataflow::Lattice<AxisInfo> *> operands) override {
+  AxisInfo getAxisInfo(triton::ExpandDimsOp op,
+                       ArrayRef<LatticeElement<AxisInfo> *> operands) override {
     AxisInfo opInfo = operands[0]->getValue();
     AxisInfo::DimVectorT contiguity = opInfo.getContiguity();
     AxisInfo::DimVectorT divisibility = opInfo.getDivisibility();
@@ -463,9 +458,8 @@ class BroadcastOpAxisInfoVisitor final
 public:
   using AxisInfoVisitorImpl<triton::BroadcastOp>::AxisInfoVisitorImpl;
 
-  AxisInfo
-  getAxisInfo(triton::BroadcastOp op,
-              ArrayRef<const dataflow::Lattice<AxisInfo> *> operands) override {
+  AxisInfo getAxisInfo(triton::BroadcastOp op,
+                       ArrayRef<LatticeElement<AxisInfo> *> operands) override {
     Type _retTy = *op->result_type_begin();
     Type _opTy = *op->operand_type_begin();
     TensorType retTy = _retTy.cast<TensorType>();
@@ -492,9 +486,8 @@ class CmpOpAxisInfoVisitor final : public AxisInfoVisitorImpl<OpTy> {
 public:
   using AxisInfoVisitorImpl<OpTy>::AxisInfoVisitorImpl;
 
-  AxisInfo
-  getAxisInfo(OpTy op,
-              ArrayRef<const dataflow::Lattice<AxisInfo> *> operands) override {
+  AxisInfo getAxisInfo(OpTy op,
+                       ArrayRef<LatticeElement<AxisInfo> *> operands) override {
     auto resTy = op.getResult().getType().template dyn_cast<RankedTensorType>();
     if (!resTy)
       return AxisInfo();
@@ -603,9 +596,8 @@ class SelectOpAxisInfoVisitor final : public AxisInfoVisitorImpl<OpTy> {
 public:
   using AxisInfoVisitorImpl<OpTy>::AxisInfoVisitorImpl;
 
-  AxisInfo
-  getAxisInfo(OpTy op,
-              ArrayRef<const dataflow::Lattice<AxisInfo> *> operands) override {
+  AxisInfo getAxisInfo(OpTy op,
+                       ArrayRef<LatticeElement<AxisInfo> *> operands) override {
     auto resTy = op.getResult().getType().template dyn_cast<RankedTensorType>();
     if (!resTy)
       return AxisInfo();
@@ -765,9 +757,8 @@ class MaxMinOpAxisInfoVisitor final : public AxisInfoVisitorImpl<OpTy> {
 public:
   using AxisInfoVisitorImpl<OpTy>::AxisInfoVisitorImpl;
 
-  AxisInfo
-  getAxisInfo(OpTy op,
-              ArrayRef<const dataflow::Lattice<AxisInfo> *> operands) override {
+  AxisInfo getAxisInfo(OpTy op,
+                       ArrayRef<LatticeElement<AxisInfo> *> operands) override {
     auto lhsInfo = operands[0]->getValue();
     auto rhsInfo = operands[1]->getValue();
     std::optional<int64_t> constantValue;
@@ -795,8 +786,8 @@ public:
 // AxisInfoAnalysis
 //===----------------------------------------------------------------------===//
 
-AxisInfoAnalysis::AxisInfoAnalysis(DataFlowSolver &solver)
-    : dataflow::SparseDataFlowAnalysis<dataflow::Lattice<AxisInfo>>(solver) {
+AxisInfoAnalysis::AxisInfoAnalysis(MLIRContext *context)
+    : ForwardDataFlowAnalysis<AxisInfo>(context) {
   // UnrealizedConversionCast:
   // This is needed by TritonGPUToLLVM, to get AxisInfo when the graph is
   // in the process of a PartialConversion, where UnrealizedConversionCast
@@ -828,7 +819,7 @@ AxisInfoAnalysis::AxisInfoAnalysis(DataFlowSolver &solver)
   visitors.append<LogicalOpAxisInfoVisitor<arith::AndIOp>,
                   LogicalOpAxisInfoVisitor<arith::OrIOp>,
                   LogicalOpAxisInfoVisitor<arith::XOrIOp>>();
-  visitors.append<SelectOpAxisInfoVisitor<mlir::arith::SelectOp>,
+  visitors.append<SelectOpAxisInfoVisitor<mlir::SelectOp>,
                   SelectOpAxisInfoVisitor<triton::gpu::SelectOp>>();
   visitors.append<ShLIOpAxisInfoVisitor, ShROpAxisInfoVisitor<arith::ShRUIOp>,
                   ShROpAxisInfoVisitor<arith::ShRSIOp>>();
@@ -838,12 +829,11 @@ AxisInfoAnalysis::AxisInfoAnalysis(DataFlowSolver &solver)
                   MaxMinOpAxisInfoVisitor<arith::MinUIOp>>();
 }
 
-void AxisInfoAnalysis::visitOperation(
-    Operation *op, ArrayRef<const dataflow::Lattice<AxisInfo> *> operands,
-    ArrayRef<dataflow::Lattice<AxisInfo> *> results) {
+ChangeResult AxisInfoAnalysis::visitOperation(
+    Operation *op, ArrayRef<LatticeElement<AxisInfo> *> operands) {
   AxisInfo curr = visitors.apply(op, operands);
   if (curr.getRank() == 0) {
-    return markAllPessimisticFixpoint(results);
+    return markAllPessimisticFixpoint(op->getResults());
   }
   // override with hint
   auto newContiguity = curr.getContiguity();
@@ -864,8 +854,11 @@ void AxisInfoAnalysis::visitOperation(
   curr = mlir::AxisInfo(newContiguity, newDivisibility, newConstancy,
                         curr.getConstantValue());
   // join all lattice elements
-  for (auto *result : results)
-    propagateIfChanged(result, result->join(curr));
+  ChangeResult result = ChangeResult::NoChange;
+  for (Value value : op->getResults()) {
+    result |= getLatticeElement(value).join(curr);
+  }
+  return result;
 }
 
 unsigned AxisInfoAnalysis::getPtrContiguity(Value ptr) {
@@ -891,10 +884,7 @@ unsigned AxisInfoAnalysis::getPtrAlignment(Value ptr) {
   auto tensorTy = ptr.getType().dyn_cast<RankedTensorType>();
   if (!tensorTy)
     return 1;
-  dataflow::Lattice<AxisInfo> *latticeElement = getLatticeElement(ptr);
-  if (!latticeElement || latticeElement->isUninitialized())
-    return 1;
-  auto axisInfo = latticeElement->getValue();
+  auto axisInfo = lookupLatticeElement(ptr)->getValue();
   auto layout = tensorTy.getEncoding();
   auto order = triton::gpu::getOrder(layout);
   auto maxMultipleBytes = axisInfo.getDivisibility(order[0]);
@@ -910,11 +900,8 @@ unsigned AxisInfoAnalysis::getMaskAlignment(Value mask) {
   auto tensorTy = mask.getType().dyn_cast<RankedTensorType>();
   if (!tensorTy)
     return 1;
-  dataflow::Lattice<AxisInfo> *latticeElement = getLatticeElement(mask);
-  if (!latticeElement || latticeElement->isUninitialized())
-    return 1;
-  auto maskAxis = latticeElement->getValue();
   auto maskOrder = triton::gpu::getOrder(tensorTy.getEncoding());
+  auto maskAxis = lookupLatticeElement(mask)->getValue();
   auto alignment = std::max<unsigned>(maskAxis.getConstancy(maskOrder[0]), 1);
   return alignment;
 }

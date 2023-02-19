@@ -1,5 +1,4 @@
 #include "triton/Analysis/Allocation.h"
-#include "mlir/Analysis/DataFlowFramework.h"
 #include "mlir/Analysis/Liveness.h"
 #include "mlir/Analysis/SliceAnalysis.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
@@ -34,8 +33,10 @@ constexpr int kPtrBitWidth = 64;
 
 static std::pair<SmallVector<unsigned>, SmallVector<unsigned>>
 getCvtOrder(const Attribute &srcLayout, const Attribute &dstLayout) {
+  auto srcBlockedLayout = srcLayout.dyn_cast<BlockedEncodingAttr>();
   auto srcMmaLayout = srcLayout.dyn_cast<MmaEncodingAttr>();
   auto srcDotLayout = srcLayout.dyn_cast<DotOperandEncodingAttr>();
+  auto dstBlockedLayout = dstLayout.dyn_cast<BlockedEncodingAttr>();
   auto dstMmaLayout = dstLayout.dyn_cast<MmaEncodingAttr>();
   auto dstDotLayout = dstLayout.dyn_cast<DotOperandEncodingAttr>();
   assert(!(srcMmaLayout && dstMmaLayout) &&
@@ -223,12 +224,14 @@ private:
   }
 
   void getValueAlias(Value value, SharedMemoryAliasAnalysis &analysis) {
-    dataflow::Lattice<AliasInfo> *latticeElement =
-        analysis.getLatticeElement(value);
-    if (latticeElement && !latticeElement->isUninitialized()) {
-      AliasInfo &info = latticeElement->getValue();
-      for (auto alloc : info.getAllocs()) {
-        allocation->addAlias(value, alloc);
+    LatticeElement<AliasInfo> *latticeElement =
+        analysis.lookupLatticeElement(value);
+    if (latticeElement) {
+      auto &info = latticeElement->getValue();
+      if (!info.getAllocs().empty()) {
+        for (auto alloc : info.getAllocs()) {
+          allocation->addAlias(value, alloc);
+        }
       }
     }
   }
@@ -241,19 +244,14 @@ private:
       getScratchValueSize(op);
     });
     // Get the alias values
-    std::unique_ptr<DataFlowSolver> solver = createDataFlowSolver();
-    SharedMemoryAliasAnalysis *aliasAnalysis =
-        solver->load<SharedMemoryAliasAnalysis>();
-    if (failed(solver->initializeAndRun(operation))) {
-      // TODO: return error instead of bailing out..
-      llvm_unreachable("failed to run SharedMemoryAliasAnalysis");
-    }
+    SharedMemoryAliasAnalysis aliasAnalysis(operation->getContext());
+    aliasAnalysis.run(operation);
     operation->walk<WalkOrder::PreOrder>([&](Operation *op) {
       for (auto operand : op->getOperands()) {
-        getValueAlias(operand, *aliasAnalysis);
+        getValueAlias(operand, aliasAnalysis);
       }
       for (auto value : op->getResults()) {
-        getValueAlias(value, *aliasAnalysis);
+        getValueAlias(value, aliasAnalysis);
       }
     });
   }

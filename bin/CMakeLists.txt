@@ -48,7 +48,7 @@ llvm_update_compile_flags(triton-translate)
          # MLIR core
          MLIROptLib
          MLIRIR
-         MLIRLLVMDialect
+         MLIRLLVMIR
          MLIRPass
          MLIRSupport
          MLIRTransforms

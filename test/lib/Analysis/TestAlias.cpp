@@ -9,10 +9,10 @@ using namespace mlir;
 namespace {
 
 struct TestAliasPass
-    : public PassWrapper<TestAliasPass, OperationPass<func::FuncOp>> {
+    : public PassWrapper<TestAliasPass, OperationPass<FuncOp>> {
 
-  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(TestAliasPass);
-
+  // LLVM15+
+  // MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(TestAliasPass);
   static void print(StringRef name, SmallVector<std::string, 4> &vals,
                     raw_ostream &os) {
     if (vals.empty())
@@ -39,24 +39,23 @@ struct TestAliasPass
     auto opName = SymbolTable::getSymbolName(operation).getValue().str();
     os << opName << "\n";
 
-    std::unique_ptr<DataFlowSolver> solver = createDataFlowSolver();
-    SharedMemoryAliasAnalysis *analysis =
-        solver->load<SharedMemoryAliasAnalysis>();
-    if (failed(solver->initializeAndRun(operation)))
-      return signalPassFailure();
+    SharedMemoryAliasAnalysis analysis(&getContext());
+    analysis.run(operation);
 
     AsmState state(operation->getParentOfType<ModuleOp>());
     // Get operation ids of value's aliases
     auto getAllocOpNames = [&](Value value) {
-      dataflow::Lattice<AliasInfo> *latticeElement =
-          analysis->getLatticeElement(value);
+      LatticeElement<AliasInfo> *latticeElement =
+          analysis.lookupLatticeElement(value);
       SmallVector<std::string, 4> opNames;
-      if (latticeElement && !latticeElement->isUninitialized()) {
+      if (latticeElement) {
         auto &info = latticeElement->getValue();
-        for (auto &alias : info.getAllocs()) {
-          auto opName =
-              getValueOperandName(alias.getDefiningOp()->getResult(0), state);
-          opNames.push_back(std::move(opName));
+        if (!info.getAllocs().empty()) {
+          for (auto &alias : info.getAllocs()) {
+            auto opName =
+                getValueOperandName(alias.getDefiningOp()->getResult(0), state);
+            opNames.push_back(std::move(opName));
+          }
         }
       }
       // Ensure deterministic output

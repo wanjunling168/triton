@@ -25,9 +25,12 @@ def Triton_Dialect : Dialect {
   let dependentDialects = [
     "arith::ArithmeticDialect",
     "math::MathDialect",
+    "StandardOpsDialect",
     "scf::SCFDialect",
-    "cf::ControlFlowDialect",
-    "func::FuncDialect"
+
+    // Since LLVM 15
+    // "cf::ControlFlowDialect",
+    // "func::FuncDialect"
   ];
 
   let extraClassDeclaration = [{
@@ -35,7 +38,6 @@ def Triton_Dialect : Dialect {
   }];
 
   let hasConstantMaterializer = 1;
-  let useDefaultTypePrinterParser = 1;
 }
 
 include "triton/Dialect/Triton/IR/TritonTypes.td"
