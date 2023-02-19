@@ -15,7 +15,8 @@ Value getStructFromElements(Location loc, ValueRange resultVals,
   Value llvmStruct = rewriter.create<LLVM::UndefOp>(loc, structType);
   for (const auto &v : llvm::enumerate(resultVals)) {
     assert(v.value() && "can not insert null values");
-    llvmStruct = insert_val(structType, llvmStruct, v.value(), v.index());
+    llvmStruct = insert_val(structType, llvmStruct, v.value(),
+                            rewriter.getI64ArrayAttr(v.index()));
   }
   return llvmStruct;
 }
@@ -31,7 +32,7 @@ SmallVector<Value> getElementsFromStruct(Location loc, Value llvmStruct,
   SmallVector<Value> results(types.size());
   for (unsigned i = 0; i < types.size(); ++i) {
     Type type = types[i];
-    results[i] = extract_val(type, llvmStruct, i);
+    results[i] = extract_val(type, llvmStruct, i64_arr_attr(i));
   }
   return results;
 }

@@ -50,9 +50,10 @@ private:
 
     for (const auto &attr : op->getAttrs()) {
       if (attr.getName() == SymbolTable::getSymbolAttrName() ||
-          attr.getName() == op.getFunctionTypeAttrName() ||
+          attr.getName() == FunctionOpInterface::getTypeAttrName() ||
           attr.getName() == "std.varargs" ||
-          (filterArgAttrs && attr.getName() == op.getArgAttrsAttrName()))
+          (filterArgAttrs &&
+           attr.getName() == FunctionOpInterface::getArgDictAttrName()))
         continue;
       result.push_back(attr);
     }
@@ -93,8 +94,8 @@ protected:
               ? resAttrDicts
               : rewriter.getArrayAttr(
                     {wrapAsStructAttrs(rewriter, resAttrDicts)});
-      attributes.push_back(
-          rewriter.getNamedAttr(funcOp.getResAttrsAttrName(), newResAttrDicts));
+      attributes.push_back(rewriter.getNamedAttr(
+          FunctionOpInterface::getResultDictAttrName(), newResAttrDicts));
     }
     if (ArrayAttr argAttrDicts = funcOp.getAllArgAttrs()) {
       SmallVector<Attribute, 4> newArgAttrs(
@@ -105,8 +106,9 @@ protected:
         for (size_t j = 0; j < mapping->size; ++j)
           newArgAttrs[mapping->inputNo + j] = argAttrDicts[i];
       }
-      attributes.push_back(rewriter.getNamedAttr(
-          funcOp.getArgAttrsAttrName(), rewriter.getArrayAttr(newArgAttrs)));
+      attributes.push_back(
+          rewriter.getNamedAttr(FunctionOpInterface::getArgDictAttrName(),
+                                rewriter.getArrayAttr(newArgAttrs)));
     }
     for (const auto &pair : llvm::enumerate(attributes)) {
       if (pair.value().getName() == "llvm.linkage") {

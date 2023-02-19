@@ -267,12 +267,6 @@ class AxisInfoAnalysis
 private:
   AxisInfoVisitorList visitors;
 
-  void setToEntryState(dataflow::Lattice<AxisInfo> *lattice) override {
-    propagateIfChanged(
-        lattice,
-        lattice->join(AxisInfo::getPessimisticValueState(lattice->getPoint())));
-  }
-
 public:
   AxisInfoAnalysis(DataFlowSolver &solver);
   using dataflow::SparseDataFlowAnalysis<

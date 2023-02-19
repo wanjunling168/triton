@@ -1,5 +1,5 @@
 #include "triton/Conversion/TritonGPUToLLVM/PTXAsmFormat.h"
-#include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/Arithmetic/IR/Arithmetic.h"
 #include "mlir/IR/Builders.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 
@@ -12,7 +12,7 @@ protected:
   static constexpr int numValues = 4;
 
   PTXAsmFormatTest() {
-    ctx.loadDialect<arith::ArithDialect>();
+    ctx.loadDialect<arith::ArithmeticDialect>();
 
     createValues();
   }

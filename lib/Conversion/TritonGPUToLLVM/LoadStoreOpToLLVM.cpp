@@ -73,14 +73,14 @@ struct LoadOpConversion
     auto loc = op->getLoc();
 
     // original values
-    Value ptr = op.getPtr();
-    Value mask = op.getMask();
-    Value other = op.getOther();
+    Value ptr = op.ptr();
+    Value mask = op.mask();
+    Value other = op.other();
 
     // adaptor values
-    Value llPtr = adaptor.getPtr();
-    Value llMask = adaptor.getMask();
-    Value llOther = adaptor.getOther();
+    Value llPtr = adaptor.ptr();
+    Value llMask = adaptor.mask();
+    Value llOther = adaptor.other();
 
     // Determine the vectorization size
     Type valueTy = op.getResult().getType();
@@ -158,14 +158,14 @@ struct LoadOpConversion
 
       // Define the instruction opcode
       auto &ld = ptxBuilder.create<>("ld")
-                     ->o("volatile", op.getIsVolatile())
+                     ->o("volatile", op.isVolatile())
                      .global()
-                     .o("ca", op.getCache() == triton::CacheModifier::CA)
-                     .o("cg", op.getCache() == triton::CacheModifier::CG)
+                     .o("ca", op.cache() == triton::CacheModifier::CA)
+                     .o("cg", op.cache() == triton::CacheModifier::CG)
                      .o("L1::evict_first",
-                        op.getEvict() == triton::EvictionPolicy::EVICT_FIRST)
+                        op.evict() == triton::EvictionPolicy::EVICT_FIRST)
                      .o("L1::evict_last",
-                        op.getEvict() == triton::EvictionPolicy::EVICT_LAST)
+                        op.evict() == triton::EvictionPolicy::EVICT_LAST)
                      .o("L1::cache_hint", hasL2EvictPolicy)
                      .v(nWords)
                      .b(width);
@@ -227,7 +227,8 @@ struct LoadOpConversion
       for (unsigned int ii = 0; ii < nWords; ++ii) {
         Value curr;
         if (retTy.isa<LLVM::LLVMStructType>()) {
-          curr = extract_val(IntegerType::get(getContext(), width), ret, ii);
+          curr = extract_val(IntegerType::get(getContext(), width), ret,
+                             i64_arr_attr(ii));
         } else {
           curr = ret;
         }
@@ -266,13 +267,13 @@ struct StoreOpConversion
   LogicalResult
   matchAndRewrite(triton::StoreOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
-    Value ptr = op.getPtr();
-    Value mask = op.getMask();
-    Value value = op.getValue();
+    Value ptr = op.ptr();
+    Value mask = op.mask();
+    Value value = op.value();
 
-    Value llPtr = adaptor.getPtr();
-    Value llMask = adaptor.getMask();
-    Value llValue = adaptor.getValue();
+    Value llPtr = adaptor.ptr();
+    Value llMask = adaptor.mask();
+    Value llValue = adaptor.value();
 
     auto loc = op->getLoc();
     MLIRContext *ctx = rewriter.getContext();
@@ -387,9 +388,9 @@ struct AtomicCASOpConversion
     auto loc = op.getLoc();
     MLIRContext *ctx = rewriter.getContext();
 
-    Value llPtr = adaptor.getPtr();
-    Value llCmp = adaptor.getCmp();
-    Value llVal = adaptor.getVal();
+    Value llPtr = adaptor.ptr();
+    Value llCmp = adaptor.cmp();
+    Value llVal = adaptor.val();
 
     auto ptrElements = getElementsFromStruct(loc, llPtr, rewriter);
     auto cmpElements = getElementsFromStruct(loc, llCmp, rewriter);
@@ -461,13 +462,13 @@ struct AtomicRMWOpConversion
     auto loc = op.getLoc();
     MLIRContext *ctx = rewriter.getContext();
 
-    auto atomicRmwAttr = op.getAtomicRmwOp();
-    Value ptr = op.getPtr();
-    Value val = op.getVal();
+    auto atomicRmwAttr = op.atomic_rmw_op();
+    Value ptr = op.ptr();
+    Value val = op.val();
 
-    Value llPtr = adaptor.getPtr();
-    Value llVal = adaptor.getVal();
-    Value llMask = adaptor.getMask();
+    Value llPtr = adaptor.ptr();
+    Value llVal = adaptor.val();
+    Value llMask = adaptor.mask();
 
     auto valElements = getElementsFromStruct(loc, llVal, rewriter);
     auto ptrElements = getElementsFromStruct(loc, llPtr, rewriter);
@@ -605,9 +606,9 @@ struct InsertSliceOpConversion
                   ConversionPatternRewriter &rewriter) const override {
     // %dst = insert_slice %src into %dst[%offsets]
     Location loc = op->getLoc();
-    Value dst = op.getDest();
-    Value src = op.getSource();
-    Value res = op.getResult();
+    Value dst = op.dest();
+    Value src = op.source();
+    Value res = op.result();
     assert(allocation->getBufferId(res) == Allocation::InvalidBufferId &&
            "Only support in-place insert_slice for now");
 
@@ -618,7 +619,7 @@ struct InsertSliceOpConversion
 
     auto dstTy = dst.getType().dyn_cast<RankedTensorType>();
     auto dstLayout = dstTy.getEncoding().dyn_cast<SharedEncodingAttr>();
-    auto llDst = adaptor.getDest();
+    auto llDst = adaptor.dest();
     assert(dstLayout && "Unexpected dstLayout in InsertSliceOpConversion");
     assert(op.hasUnitStride() &&
            "Only unit stride supported by InsertSliceOpConversion");
@@ -631,7 +632,7 @@ struct InsertSliceOpConversion
     auto mixedOffsets = op.getMixedOffsets();
     for (auto i = 0; i < mixedOffsets.size(); ++i) {
       if (op.isDynamicOffset(i)) {
-        offsets.emplace_back(adaptor.getOffsets()[i]);
+        offsets.emplace_back(adaptor.offsets()[i]);
       } else {
         offsets.emplace_back(i32_val(op.getStaticOffset(i)));
       }
@@ -649,7 +650,7 @@ struct InsertSliceOpConversion
     auto elemPtrTy = ptr_ty(elemTy, 3);
     auto smemBase = gep(elemPtrTy, smemObj.base, offset);
 
-    auto llSrc = adaptor.getSource();
+    auto llSrc = adaptor.source();
     auto srcIndices = emitIndices(loc, rewriter, srcLayout, srcShape);
     storeDistributedToShared(src, llSrc, srcStrides, srcIndices, dst, smemBase,
                              elemTy, loc, rewriter);
@@ -680,11 +681,11 @@ struct InsertSliceAsyncOpConversion
                   ConversionPatternRewriter &rewriter) const override {
     // insert_slice_async %src, %dst, %index, %mask, %other
     auto loc = op.getLoc();
-    Value src = op.getSrc();
-    Value dst = op.getDst();
-    Value res = op.getResult();
-    Value mask = op.getMask();
-    Value other = op.getOther();
+    Value src = op.src();
+    Value dst = op.dst();
+    Value res = op.result();
+    Value mask = op.mask();
+    Value other = op.other();
     assert(allocation->getBufferId(res) == Allocation::InvalidBufferId &&
            "Only support in-place insert_slice_async for now");
 
@@ -697,11 +698,11 @@ struct InsertSliceAsyncOpConversion
     assert(srcShape.size() == 2 &&
            "insert_slice_async: Unexpected rank of %src");
 
-    Value llDst = adaptor.getDst();
-    Value llSrc = adaptor.getSrc();
-    Value llMask = adaptor.getMask();
-    Value llOther = adaptor.getOther();
-    Value llIndex = adaptor.getIndex();
+    Value llDst = adaptor.dst();
+    Value llSrc = adaptor.src();
+    Value llMask = adaptor.mask();
+    Value llOther = adaptor.other();
+    Value llIndex = adaptor.index();
 
     // %src
     auto srcElems = getLLVMElems(src, llSrc, rewriter, loc);
@@ -801,7 +802,7 @@ struct InsertSliceAsyncOpConversion
             ptxBuilder.newAddrOperand(srcElems[elemIdx + wordElemIdx], "l");
         auto *copySize = ptxBuilder.newConstantOperand(byteWidth);
         auto *srcSize = copySize;
-        if (op.getMask()) {
+        if (op.mask()) {
           // We don't use predicate in this case, setting src-size to 0
           // if there's any mask. cp.async will automatically fill the
           // remaining slots with 0 if cp-size > src-size.

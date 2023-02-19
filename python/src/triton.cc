@@ -11,7 +11,6 @@
 #include "mlir/Parser/Parser.h"
 #include "mlir/Support/FileUtilities.h"
 
-#include "mlir/Dialect/ControlFlow/IR/ControlFlow.h"
 #include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "triton/Analysis/Allocation.h"
@@ -391,9 +390,8 @@ void init_triton_ir(py::module &&m) {
         mlir::DialectRegistry registry;
         registry.insert<mlir::triton::TritonDialect,
                         mlir::triton::gpu::TritonGPUDialect,
-                        mlir::math::MathDialect, mlir::arith::ArithDialect,
-                        mlir::func::FuncDialect, mlir::scf::SCFDialect,
-                        mlir::cf::ControlFlowDialect>();
+                        mlir::math::MathDialect, mlir::arith::ArithmeticDialect,
+                        mlir::func::FuncDialect, mlir::scf::SCFDialect>();
         context.appendDialectRegistry(registry);
         context.loadAllAvailableDialects();
 

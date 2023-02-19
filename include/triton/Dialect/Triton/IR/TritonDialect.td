@@ -14,7 +14,7 @@ def Triton_Dialect : Dialect {
     Triton Dialect.
 
     Dependent Dialects:
-      * Arith:
+      * Arithmetic:
         * addf, addi, andi, cmpf, cmpi, divf, fptosi, ...
       * Math:
         * exp, sin, cos, log, ...
@@ -23,7 +23,7 @@ def Triton_Dialect : Dialect {
   }];
 
   let dependentDialects = [
-    "arith::ArithDialect",
+    "arith::ArithmeticDialect",
     "math::MathDialect",
     "scf::SCFDialect",
     "cf::ControlFlowDialect",

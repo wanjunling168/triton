@@ -1,6 +1,6 @@
 #include "Utility.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
-#include "mlir/IR/IRMapping.h"
+#include "mlir/IR/BlockAndValueMapping.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 
 namespace mlir {
@@ -36,7 +36,7 @@ public:
         forOp.getStep(), newInitArgs);
     newForOp->moveBefore(forOp);
     rewriter.setInsertionPointToStart(newForOp.getBody());
-    IRMapping mapping;
+    BlockAndValueMapping mapping;
     for (const auto &arg : llvm::enumerate(forOp.getRegionIterArgs()))
       mapping.map(arg.value(), newForOp.getRegionIterArgs()[arg.index()]);
     mapping.map(forOp.getInductionVar(), newForOp.getInductionVar());

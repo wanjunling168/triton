@@ -29,7 +29,9 @@ struct CoalescePass : public TritonGPUCoalesceBase<CoalescePass> {
     size_t rank = origType.getRank();
     dataflow::Lattice<AxisInfo> *latticeElement =
         axisInfo.getLatticeElement(ptr);
-    AxisInfo info = latticeElement ? latticeElement->getValue() : AxisInfo();
+    AxisInfo info = latticeElement && !latticeElement->isUninitialized()
+                        ? latticeElement->getValue()
+                        : AxisInfo();
     // Get the contiguity order of `ptr`
     auto order = argSort(info.getContiguity());
     // The desired divisibility is the maximum divisibility
@@ -136,15 +138,15 @@ struct CoalescePass : public TritonGPUCoalesceBase<CoalescePass> {
     op->walk([&](Operation *curr) {
       Value ptr;
       if (auto op = dyn_cast<triton::LoadOp>(curr))
-        ptr = op.getPtr();
+        ptr = op.ptr();
       if (auto op = dyn_cast<triton::AtomicRMWOp>(curr))
-        ptr = op.getPtr();
+        ptr = op.ptr();
       if (auto op = dyn_cast<triton::AtomicCASOp>(curr))
-        ptr = op.getPtr();
+        ptr = op.ptr();
       if (auto op = dyn_cast<triton::gpu::InsertSliceAsyncOp>(curr))
-        ptr = op.getSrc();
+        ptr = op.src();
       if (auto op = dyn_cast<triton::StoreOp>(curr))
-        ptr = op.getPtr();
+        ptr = op.ptr();
       if (!ptr)
         return;
       RankedTensorType ty = ptr.getType().template dyn_cast<RankedTensorType>();
@@ -167,24 +169,24 @@ struct CoalescePass : public TritonGPUCoalesceBase<CoalescePass> {
     op->walk([&](Operation *curr) {
       OpBuilder builder(curr);
       if (auto load = dyn_cast<triton::LoadOp>(curr)) {
-        coalesceOp<triton::LoadOp>(layoutMap, curr, load.getPtr(), builder);
+        coalesceOp<triton::LoadOp>(layoutMap, curr, load.ptr(), builder);
         return;
       }
       if (auto op = dyn_cast<triton::AtomicRMWOp>(curr)) {
-        coalesceOp<triton::AtomicRMWOp>(layoutMap, curr, op.getPtr(), builder);
+        coalesceOp<triton::AtomicRMWOp>(layoutMap, curr, op.ptr(), builder);
         return;
       }
       if (auto op = dyn_cast<triton::AtomicCASOp>(curr)) {
-        coalesceOp<triton::AtomicCASOp>(layoutMap, curr, op.getPtr(), builder);
+        coalesceOp<triton::AtomicCASOp>(layoutMap, curr, op.ptr(), builder);
         return;
       }
       if (auto load = dyn_cast<triton::gpu::InsertSliceAsyncOp>(curr)) {
-        coalesceOp<triton::gpu::InsertSliceAsyncOp>(layoutMap, curr,
-                                                    load.getSrc(), builder);
+        coalesceOp<triton::gpu::InsertSliceAsyncOp>(layoutMap, curr, load.src(),
+                                                    builder);
         return;
       }
       if (auto store = dyn_cast<triton::StoreOp>(curr)) {
-        coalesceOp<triton::StoreOp>(layoutMap, curr, store.getPtr(), builder);
+        coalesceOp<triton::StoreOp>(layoutMap, curr, store.ptr(), builder);
         return;
       }
     });
