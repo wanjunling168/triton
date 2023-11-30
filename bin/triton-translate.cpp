@@ -14,7 +14,7 @@
 #include "triton/Conversion/TritonToTritonGPU/TritonToTritonGPUPass.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
-#include "triton/Target/HSACO/HSACOTranslation.h"
+#include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 #include "triton/Target/LLVMIR/LLVMIRTranslation.h"
 #include "triton/Target/PTX/PTXTranslation.h"
 #include "llvm/IR/LLVMContext.h"
@@ -38,6 +38,7 @@ OwningOpRef<ModuleOp> loadMLIRModule(llvm::StringRef inputFilename,
   mlir::DialectRegistry registry;
   registry
       .insert<TritonDialect, triton::gpu::TritonGPUDialect,
+              triton::nvidia_gpu::TritonNvidiaGPUDialect,
               mlir::math::MathDialect, arith::ArithDialect, scf::SCFDialect>();
 
   context.appendDialectRegistry(registry);
@@ -101,10 +102,15 @@ LogicalResult tritonTranslateMain(int argc, char **argv,
       "", llvm::cl::desc("AMDGCN features. e.g. '+sramecc,-xnack'"),
       llvm::cl::value_desc("features"), llvm::cl::init("+sramecc,-xnack"));
 
+  static llvm::cl::opt<bool> enableFpFusion(
+      "enable-fp-fusion", llvm::cl::desc("Enables fusion of fadd/fmul"),
+      llvm::cl::init(true));
+
   llvm::InitLLVM y(argc, argv);
 
   registerAsmPrinterCLOptions();
   registerMLIRContextCLOptions();
+  registerPassManagerCLOptions();
   llvm::cl::ParseCommandLineOptions(argc, argv, toolName);
 
   mlir::MLIRContext context;
@@ -121,22 +127,20 @@ LogicalResult tritonTranslateMain(int argc, char **argv,
   }
 
   llvm::LLVMContext llvmContext;
-  auto llvmir = translateTritonGPUToLLVMIR(&llvmContext, *module,
-                                           SMArch.getValue(), false /*isRocm*/);
+  mlir::triton::gpu::TMAMetadataTy tmaInfos;
+  auto llvmir = translateTritonGPUToLLVMIR(
+      &llvmContext, *module, SMArch.getValue(), tmaInfos, Target::Default);
+
   if (!llvmir) {
     llvm::errs() << "Translate to LLVM IR failed";
   }
 
-  if (targetKind == "llvmir")
+  if (targetKind == "llvmir") {
     llvm::outs() << *llvmir << '\n';
-  else if (targetKind == "ptx")
+  } else if (targetKind == "ptx") {
     llvm::outs() << ::triton::translateLLVMIRToPTX(*llvmir, SMArch.getValue(),
-                                                   ptxVersion.getValue());
-  else if (targetKind == "hsaco") {
-    auto [module, hsaco] = ::triton::translateLLVMIRToHSACO(
-        *llvmir, GCNArch.getValue(), GCNTriple.getValue(),
-        GCNFeatures.getValue());
-    llvm::outs() << hsaco;
+                                                   ptxVersion.getValue(),
+                                                   enableFpFusion.getValue());
   } else {
     llvm::errs() << "Error: Unknown target specified: " << targetKind << "\n";
     return failure();

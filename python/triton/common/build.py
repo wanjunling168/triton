@@ -18,7 +18,11 @@ def is_hip():
 
 @functools.lru_cache()
 def libcuda_dirs():
-    libs = subprocess.check_output(["ldconfig", "-p"]).decode()
+    env_libcuda_path = os.getenv("TRITON_LIBCUDA_PATH")
+    if env_libcuda_path:
+        return [env_libcuda_path]
+
+    libs = subprocess.check_output(["/sbin/ldconfig", "-p"]).decode()
     # each line looks like the following:
     # libcuda.so.1 (libc6,x86-64) => /lib/x86_64-linux-gnu/libcuda.so.1
     locs = [line.split()[-1] for line in libs.splitlines() if "libcuda.so" in line]
@@ -27,6 +31,9 @@ def libcuda_dirs():
     if locs:
         msg += 'Possible files are located at %s.' % str(locs)
         msg += 'Please create a symlink of libcuda.so to any of the file.'
+    else:
+        msg += 'Please make sure GPU is setup and then run "/sbin/ldconfig"'
+        msg += ' (requires sudo) to refresh the linker cache.'
     assert any(os.path.exists(os.path.join(path, 'libcuda.so')) for path in dirs), msg
     return dirs
 
@@ -83,9 +90,15 @@ def _build(name, src, srcdir):
     py_include_dir = sysconfig.get_paths(scheme=scheme)["include"]
 
     if is_hip():
-        ret = subprocess.check_call([cc, src, f"-I{hip_include_dir}", f"-I{py_include_dir}", f"-I{srcdir}", "-shared", "-fPIC", f"-L{hip_lib_dir}", "-lamdhip64", "-o", so])
+        ret = subprocess.check_call([
+            cc, src, f"-I{hip_include_dir}", f"-I{py_include_dir}", f"-I{srcdir}", "-shared", "-fPIC",
+            f"-L{hip_lib_dir}", "-lamdhip64", "-o", so
+        ])
     else:
-        cc_cmd = [cc, src, "-O3", f"-I{cu_include_dir}", f"-I{py_include_dir}", f"-I{srcdir}", "-shared", "-fPIC", "-lcuda", "-o", so]
+        cc_cmd = [
+            cc, src, "-O3", f"-I{cu_include_dir}", f"-I{py_include_dir}", f"-I{srcdir}", "-shared", "-fPIC", "-lcuda",
+            "-o", so
+        ]
         cc_cmd += [f"-L{dir}" for dir in cuda_lib_dirs]
         ret = subprocess.check_call(cc_cmd)
 

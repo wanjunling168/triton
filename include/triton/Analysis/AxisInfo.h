@@ -21,7 +21,7 @@ namespace mlir {
 /// This lattice value represents known information on the axes of a lattice.
 class AxisInfo {
 public:
-  typedef SmallVector<int64_t, 4> DimVectorT;
+  typedef SmallVector<int64_t> DimVectorT;
 
 public:
   /// Default constructor
@@ -271,8 +271,8 @@ private:
   std::vector<std::unique_ptr<AxisInfoVisitor>> visitors;
 };
 
-class AxisInfoAnalysis
-    : public dataflow::SparseDataFlowAnalysis<dataflow::Lattice<AxisInfo>> {
+class AxisInfoAnalysis : public dataflow::SparseForwardDataFlowAnalysis<
+                             dataflow::Lattice<AxisInfo>> {
 private:
   AxisInfoVisitorList visitors;
 
@@ -282,15 +282,31 @@ private:
         lattice->join(AxisInfo::getPessimisticValueState(lattice->getPoint())));
   }
 
+  void visitNonControlFlowArguments(
+      Operation *op, const RegionSuccessor &successor,
+      ArrayRef<dataflow::Lattice<AxisInfo> *> argLattices,
+      unsigned firstIndex) override {
+    if (auto forOp = dyn_cast<scf::ForOp>(op)) {
+      visitForOpInductionVar(forOp, argLattices);
+    } else {
+      setAllToEntryStates(argLattices.take_front(firstIndex));
+      setAllToEntryStates(argLattices.drop_front(
+          firstIndex + successor.getSuccessorInputs().size()));
+    }
+  }
+
 public:
   AxisInfoAnalysis(DataFlowSolver &solver);
-  using dataflow::SparseDataFlowAnalysis<
+  using dataflow::SparseForwardDataFlowAnalysis<
       dataflow::Lattice<AxisInfo>>::getLatticeElement;
   using FuncAxisInfoMapT = DenseMap<FunctionOpInterface, AxisInfo>;
 
   void visitOperation(Operation *op,
                       ArrayRef<const dataflow::Lattice<AxisInfo> *> operands,
                       ArrayRef<dataflow::Lattice<AxisInfo> *> results) override;
+  void
+  visitForOpInductionVar(scf::ForOp op,
+                         ArrayRef<dataflow::Lattice<AxisInfo> *> argLattices);
 };
 
 /// Module level axis info analysis based on the call graph, assuming that we

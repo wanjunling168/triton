@@ -5,14 +5,13 @@ import triton
 import triton.ops
 
 
-@pytest.mark.parametrize("M, N, dtype, mode",
-                         [
-                             (M, N, dtype, mode) for M in [1024, 821]
-                             for N in [512, 857, 1871, 2089, 8573, 31000]
-                             for dtype in ['float16', 'float32']
-                             for mode in ['forward', 'backward']
-                         ]
-                         )
+@pytest.mark.parametrize("M, N, dtype, mode", [  #
+    (M, N, dtype, mode)
+    for M in [1024, 821]
+    for N in [512, 857, 1871, 2089, 8573, 31000]
+    for dtype in ['float16', 'float32']
+    for mode in ['forward', 'backward']
+])
 def test_op(M, N, dtype, mode):
     capability = torch.cuda.get_device_capability()
     if capability[0] < 8 and dtype == "bfloat16":
@@ -25,7 +24,7 @@ def test_op(M, N, dtype, mode):
     tt_y = triton.ops.cross_entropy(x, idx)
     th_y = torch.nn.CrossEntropyLoss(reduction="none")(x, idx)
     if mode == 'forward':
-        torch.testing.assert_allclose(th_y, tt_y)
+        torch.testing.assert_close(th_y, tt_y)
     # backward pass
     elif mode == 'backward':
         dy = torch.randn_like(tt_y)
@@ -36,5 +35,7 @@ def test_op(M, N, dtype, mode):
         x.grad = None
         th_y.backward(dy)
         th_dx = x.grad.clone()
-
-        torch.testing.assert_allclose(th_dx, tt_dx)
+        if dtype == torch.float16:
+            torch.testing.assert_close(th_dx, tt_dx, rtol=0.001, atol=0.001)
+        else:
+            torch.testing.assert_close(th_dx, tt_dx)

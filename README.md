@@ -2,12 +2,11 @@
   <img src="https://cdn.openai.com/triton/assets/triton-logo.png" alt="Triton logo" width="88" height="100">
 </div>
 
-[![Wheels](https://github.com/openai/triton/actions/workflows/wheels.yml/badge.svg?branch=release/2.0.x)](https://github.com/openai/triton/actions/workflows/wheels.yml)
+We're hiring! If you are interested in working on Triton at OpenAI, we have roles open for [Compiler Engineers](https://openai.com/careers/software-engineer-triton-compiler) and [Kernel Engineers](https://openai.com/careers/kernel-engineer).
 
-
-**`Documentation`** |
-------------------- |
-[![Documentation](https://github.com/openai/triton/actions/workflows/documentation.yml/badge.svg)](https://triton-lang.org/)
+| **`Documentation`** | **`Nightly Wheels`** |
+|-------------------- | -------------------- |
+| [![Documentation](https://github.com/openai/triton/actions/workflows/documentation.yml/badge.svg)](https://triton-lang.org/) | [![Wheels](https://github.com/openai/triton/actions/workflows/wheels.yml/badge.svg?branch=release/2.0.x)](https://github.com/openai/triton/actions/workflows/wheels.yml) |
 
 
 # Triton
@@ -37,12 +36,113 @@ pip install -U --index-url https://aiinfra.pkgs.visualstudio.com/PublicPackages/
 
 ```
 git clone https://github.com/openai/triton.git;
-cd triton/python;
-pip install cmake; # build-time dependency
-pip install -e .
+cd triton;
+
+pip install ninja cmake wheel; # build-time dependencies
+pip install -e python
 ```
 
+Or with a virtualenv:
 
+```
+git clone https://github.com/openai/triton.git;
+cd triton;
+
+python -m venv .venv --prompt triton;
+source .venv/bin/activate;
+
+pip install ninja cmake wheel; # build-time dependencies
+pip install -e python
+```
+
+# Building with a custom LLVM
+
+Triton uses LLVM to generate code for GPUs and CPUs.  Normally, the Triton build
+downloads a prebuilt LLVM, but you can also build LLVM from source and use that.
+
+LLVM does not have a stable API, so the Triton build will not work at an
+arbitrary LLVM version.
+
+1. Find the version of LLVM that Triton builds against.  Check
+`cmake/llvm-hash.txt` to see the current version. For example, if it says:
+       49af6502c6dcb4a7f7520178bd14df396f78240c
+
+   This means that the version of Triton you have builds against
+   [LLVM](https://github.com/llvm/llvm-project) 49af6502.
+
+2. `git checkout` LLVM at this revision.  Optionally, make additional
+   modifications to LLVM.
+
+3. [Build LLVM](https://llvm.org/docs/CMake.html).  For example, you might run
+
+       $ cd $HOME/llvm-project  # your clone of LLVM.
+       $ mkdir build
+       $ cd build
+       $ cmake -G Ninja -DCMAKE_BUILD_TYPE=Release -DLLVM_ENABLE_ASSERTIONS=ON  ../llvm -DLLVM_ENABLE_PROJECTS="mlir;llvm"
+       $ ninja
+
+4. Grab a snack, this will take a while.
+
+5. Build Triton as above, but set the following environment variables.
+
+       # Modify as appropriate to point to your LLVM build.
+       $ export LLVM_BUILD_DIR=$HOME/llvm-project/build
+
+       $ cd <triton install>
+       $ LLVM_INCLUDE_DIRS=$LLVM_BUILD_DIR/include \
+         LLVM_LIBRARY_DIR=$LLVM_BUILD_DIR/lib \
+         LLVM_SYSPATH=$LLVM_BUILD_DIR \
+         pip install -e python
+
+# Tips for building
+
+- Set `TRITON_BUILD_WITH_CLANG_LLD=true` as an environment variable to use clang
+  and lld.  lld in particular results in faster builds.
+
+- Set `TRITON_BUILD_WITH_CCACHE=true` to build with ccache.
+
+- Pass `--no-build-isolation` to `pip install` to make nop builds faster.
+  Without this, every invocation of `pip install` uses a different symlink to
+  cmake, and this forces ninja to rebuild most of the `.a` files.
+
+- vscode intellisense has some difficulty figuring out how to build Triton's C++
+  (probably because, in our build, users don't invoke cmake directly, but
+  instead use setup.py).  Teach vscode how to compile Triton as follows.
+
+    - Do a local build.
+    - Get the full path to the `compile_commands.json` file produced by the build:
+      `find python/build -name 'compile_commands.json | xargs readlink -f'`
+    - In vscode, install the
+      [C/C++
+      extension](https://marketplace.visualstudio.com/items?itemName=ms-vscode.cpptools),
+      then open the command palette (`Shift + Command + P` on Mac, or `Shift +
+      Ctrl + P` on Windows/Linux) and open `C/C++: Edit Configurations (UI)`.
+    - Open "Advanced Settings" and paste the full path to
+      `compile_commands.json` into the "Compile Commands" textbox.
+
+# Running tests
+
+There currently isn't a turnkey way to run all the Triton tests, but you can
+follow the following recipe.
+
+```shell
+# One-time setup.  Note we have to reinstall local Triton because torch
+# overwrites it with the public version.
+$ pip install scipy numpy torch pytest lit && pip install -e python
+
+# Run Python tests using your local GPU.
+$ python3 -m pytest python/test/unit
+
+# Move to builddir.  Fill in <...> with the full path, e.g.
+# `cmake.linux-x86_64-cpython-3.11`.
+$ cd python/build/cmake<...>
+
+# Run C++ unit tests.
+$ ninja test
+
+# Run lit tests.
+$ lit test
+```
 
 # Changelog
 
@@ -55,10 +155,6 @@ Version 2.0 is out! New features include:
 # Contributing
 
 Community contributions are more than welcome, whether it be to fix bugs or to add new features at [github](https://github.com/openai/triton/). For more detailed instructions, please visit our [contributor's guide](CONTRIBUTING.md).
-
-If you’re interested in joining our team and working on Triton & GPU kernels, [we’re hiring](https://openai.com/jobs/#acceleration)!
-
-
 
 
 # Compatibility

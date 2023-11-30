@@ -1,24 +1,25 @@
 #include "Utility.h"
 #include "TypeConverter.h"
-
+#include "mlir/Dialect/LLVMIR/NVVMDialect.h"
+#include "triton/Dialect/NVGPU/IR/Dialect.h"
 namespace mlir {
 
 namespace LLVM {
 using namespace mlir::triton;
 
-Value createConstantI32(Location loc, PatternRewriter &rewriter, int32_t v) {
+Value createConstantI32(Location loc, OpBuilder &rewriter, int32_t v) {
   auto i32ty = rewriter.getIntegerType(32);
   return rewriter.create<LLVM::ConstantOp>(loc, i32ty,
                                            IntegerAttr::get(i32ty, v));
 }
 
-Value createConstantF32(Location loc, PatternRewriter &rewriter, float v) {
+Value createConstantF32(Location loc, OpBuilder &rewriter, float v) {
   auto type = type::f32Ty(rewriter.getContext());
   return rewriter.create<LLVM::ConstantOp>(loc, type,
                                            rewriter.getF32FloatAttr(v));
 }
 
-Value createConstantF64(Location loc, PatternRewriter &rewriter, float v) {
+Value createConstantF64(Location loc, OpBuilder &rewriter, float v) {
   auto type = type::f64Ty(rewriter.getContext());
   return rewriter.create<LLVM::ConstantOp>(loc, type,
                                            rewriter.getF64FloatAttr(v));
@@ -40,8 +41,98 @@ Value createLLVMIntegerConstant(OpBuilder &builder, Location loc, short width,
                                           builder.getIntegerAttr(ty, value));
 }
 
+// A wrapper of LoadDSmemOp when vec = 1
+// (1) Get bitwidth from elemTy
+// (2) Create LoadDSmemOp
+// (3) Bitcast result from dataTy (u16/u32/u64) back to elemTy
+Value createLoadDSmem(Location loc, PatternRewriter &rewriter, Value addr,
+                      Value ctaId, Type elemTy) {
+  assert(addr.getType().isa<LLVMPointerType>() &&
+         "addr must be a pointer type");
+  auto ptrTy = addr.getType().cast<LLVMPointerType>();
+  assert(ptrTy.getAddressSpace() == 3 && "Invalid addr space for load_dsmem");
+  unsigned bitwidth = elemTy.getIntOrFloatBitWidth();
+  Value ret =
+      rewriter.create<triton::nvgpu::LoadDSmemOp>(loc, addr, ctaId, bitwidth);
+  return bitcast(ret, elemTy);
+}
+
+// A wrapper of LoadDSmemOp when vec > 1
+// (1) Get bitwidth from elemTy
+// (2) Create LoadDSmemOp and extract results from retStruct
+// (3) Bitcast results from dataTy (u16/u32/u64) back to elemTy
+SmallVector<Value> createLoadDSmem(Location loc, PatternRewriter &rewriter,
+                                   Value addr, Value ctaId, unsigned vec,
+                                   Type elemTy) {
+  assert(addr.getType().isa<LLVMPointerType>() &&
+         "addr must be a pointer type");
+  auto ptrTy = addr.getType().cast<LLVMPointerType>();
+  assert(ptrTy.getAddressSpace() == 3 && "Invalid addr space for load_dsmem");
+  unsigned bitwidth = elemTy.getIntOrFloatBitWidth();
+  Value retStruct = rewriter.create<triton::nvgpu::LoadDSmemOp>(
+      loc, addr, ctaId, bitwidth, vec);
+  SmallVector<Value> retVals;
+  for (unsigned i = 0; i < vec; ++i) {
+    auto dataTy = rewriter.getIntegerType(bitwidth);
+    Value data = extract_val(dataTy, retStruct, i);
+    retVals.push_back(bitcast(data, elemTy));
+  }
+  return retVals;
+}
+
+// A wrapper of StoreDSmemOp when vec = 1
+// (1) Get bitwidth from elemTy
+// (2) Bitcast value from elemTy to dataTy (u16/u32/u64)
+// (3) Create StoreDSmemOp
+void createStoreDSmem(Location loc, PatternRewriter &rewriter, Value addr,
+                      Value ctaId, Value value, Value pred) {
+  assert(addr.getType().isa<LLVMPointerType>() &&
+         "addr must be a pointer type");
+  auto ptrTy = addr.getType().cast<LLVMPointerType>();
+  assert(ptrTy.getAddressSpace() == 3 && "Invalid addr space for load_dsmem");
+  unsigned bitwidth = value.getType().getIntOrFloatBitWidth();
+  auto dataTy = rewriter.getIntegerType(bitwidth);
+  Value data = bitcast(value, dataTy);
+  rewriter.create<triton::nvgpu::StoreDSmemOp>(loc, addr, ctaId, data, pred);
+}
+
+// A wrapper of StoreDSmemOp when vec = 1 and pred = 1
+void createStoreDSmem(Location loc, PatternRewriter &rewriter, Value addr,
+                      Value ctaId, Value value) {
+  Value pred = int_val(/*width=*/1, 1);
+  createStoreDSmem(loc, rewriter, addr, ctaId, value, pred);
+}
+
+// A wrapper of StoreDSmemOp when vec > 1
+// (1) Get bitwidth from elemTy
+// (2) Bitcast values from elemTy to dataTy (u16/u32/u64)
+// (3) Create StoreDSmemOp
+void createStoreDSmem(Location loc, PatternRewriter &rewriter, Value addr,
+                      Value ctaId, ArrayRef<Value> values, Value pred) {
+  assert(addr.getType().isa<LLVMPointerType>() &&
+         "addr must be a pointer type");
+  auto ptrTy = addr.getType().cast<LLVMPointerType>();
+  assert(ptrTy.getAddressSpace() == 3 && "Invalid addr space for load_dsmem");
+  unsigned bitwidth = 0;
+  if (!values.empty()) {
+    bitwidth = values.back().getType().getIntOrFloatBitWidth();
+  }
+  auto dataTy = rewriter.getIntegerType(bitwidth);
+  SmallVector<Value> data;
+  for (unsigned i = 0; i < values.size(); ++i)
+    data.push_back(bitcast(values[i], dataTy));
+  rewriter.create<triton::nvgpu::StoreDSmemOp>(loc, addr, ctaId, data, pred);
+}
+
+// A wrapper of StoreDSmemOp when vec > 1 and pred = 1
+void createStoreDSmem(Location loc, PatternRewriter &rewriter, Value addr,
+                      Value ctaId, ArrayRef<Value> values) {
+  Value pred = int_val(/*width=*/1, 1);
+  createStoreDSmem(loc, rewriter, addr, ctaId, values, pred);
+}
+
 SharedMemoryObject
-getSharedMemoryObjectFromStruct(Location loc, Value llvmStruct,
+getSharedMemoryObjectFromStruct(Location loc, Value llvmStruct, Type elemTy,
                                 ConversionPatternRewriter &rewriter) {
   ArrayRef<Type> types =
       llvmStruct.getType().cast<LLVM::LLVMStructType>().getBody();
@@ -53,6 +144,7 @@ getSharedMemoryObjectFromStruct(Location loc, Value llvmStruct,
 
   auto rank = (elems.size() - 1) / 2;
   return {/*base=*/elems[0],
+          /*baseElemType=*/elemTy,
           /*strides=*/{elems.begin() + 1, elems.begin() + 1 + rank},
           /*offsets=*/{elems.begin() + 1 + rank, elems.end()}};
 }
@@ -149,7 +241,7 @@ Value linearize(ConversionPatternRewriter &rewriter, Location loc,
 Value storeShared(ConversionPatternRewriter &rewriter, Location loc, Value ptr,
                   Value val, Value pred) {
   MLIRContext *ctx = rewriter.getContext();
-  unsigned bits = val.getType().getIntOrFloatBitWidth();
+  unsigned bits = std::max(8u, val.getType().getIntOrFloatBitWidth());
   const char *c = bits == 64 ? "l" : (bits == 16 ? "h" : "r");
 
   PTXBuilder builder;
@@ -160,9 +252,26 @@ Value storeShared(ConversionPatternRewriter &rewriter, Location loc, Value ptr,
   return builder.launch(rewriter, loc, void_ty(ctx));
 }
 
+Value loadShared(ConversionPatternRewriter &rewriter, Location loc, Value ptr,
+                 Type elemTy, Value pred) {
+  MLIRContext *ctx = rewriter.getContext();
+  auto ptrTy = ptr.getType().cast<LLVMPointerType>();
+  assert(ptrTy.getAddressSpace() == 3 && "Invalid addr space for loadShared");
+  unsigned bitwidth = std::max(8u, elemTy.getIntOrFloatBitWidth());
+
+  const char *c = bitwidth == 64 ? "=l" : (bitwidth == 16 ? "=h" : "=r");
+
+  PTXBuilder builder;
+  auto *dOpr = builder.newOperand(c);
+  auto *ptrOpr = builder.newAddrOperand(ptr, "r");
+  auto &ld = builder.create<>("ld")->shared().b(bitwidth);
+  ld(dOpr, ptrOpr).predicate(pred, "b");
+  return builder.launch(rewriter, loc, elemTy);
+}
+
 static Value commonShflSync(Location loc, ConversionPatternRewriter &rewriter,
-                            Value val, int i, const std::string &shuffleType,
-                            const std::string &clamp) {
+                            Value val, Value i, NVVM::ShflKind mode,
+                            Value clamp) {
   unsigned bits = val.getType().getIntOrFloatBitWidth();
 
   if (bits == 64) {
@@ -170,33 +279,61 @@ static Value commonShflSync(Location loc, ConversionPatternRewriter &rewriter,
     Value vec = bitcast(val, vecTy);
     Value val0 = extract_element(f32_ty, vec, i32_val(0));
     Value val1 = extract_element(f32_ty, vec, i32_val(1));
-    val0 = commonShflSync(loc, rewriter, val0, i, shuffleType, clamp);
-    val1 = commonShflSync(loc, rewriter, val1, i, shuffleType, clamp);
+    val0 = commonShflSync(loc, rewriter, val0, i, mode, clamp);
+    val1 = commonShflSync(loc, rewriter, val1, i, mode, clamp);
     vec = undef(vecTy);
     vec = insert_element(vecTy, vec, val0, i32_val(0));
     vec = insert_element(vecTy, vec, val1, i32_val(1));
     return bitcast(vec, val.getType());
   }
-
-  PTXBuilder builder;
-  auto &shfl = builder.create("shfl.sync")->o(shuffleType).o("b32");
-  auto *dOpr = builder.newOperand("=r");
-  auto *aOpr = builder.newOperand(val, "r");
-  auto *bOpr = builder.newConstantOperand(i);
-  auto *cOpr = builder.newConstantOperand(clamp);
-  auto *maskOpr = builder.newConstantOperand("0xffffffff");
-  shfl(dOpr, aOpr, bOpr, cOpr, maskOpr);
-  return builder.launch(rewriter, loc, val.getType(), false);
+  Type type = val.getType();
+  if (type != i32_ty) {
+    val = bitcast(val, int_ty(bits));
+    if (bits < 32)
+      val = zext(i32_ty, val);
+  }
+  Value mask = i32_val(0xFFFFFFFF);
+  Value result = rewriter.create<NVVM::ShflOp>(loc, i32_ty, mask, val, i, clamp,
+                                               mode, UnitAttr());
+  if (type != i32_ty) {
+    if (bits < 32)
+      result = trunc(int_ty(bits), result);
+    result = bitcast(result, type);
+  }
+  return result;
 }
 
 Value shflSync(Location loc, ConversionPatternRewriter &rewriter, Value val,
                int i) {
-  return commonShflSync(loc, rewriter, val, i, "bfly", "0x1f");
+  return commonShflSync(loc, rewriter, val, i32_val(i), NVVM::ShflKind::bfly,
+                        i32_val(0x1f));
 }
 
 Value shflUpSync(Location loc, ConversionPatternRewriter &rewriter, Value val,
                  int i) {
-  return commonShflSync(loc, rewriter, val, i, "up", "0x0");
+  return commonShflSync(loc, rewriter, val, i32_val(i), NVVM::ShflKind::up,
+                        i32_val(0x0));
+}
+
+Value shflIdxSync(Location loc, ConversionPatternRewriter &rewriter, Value val,
+                  int i) {
+  return shflIdxSync(loc, rewriter, val, i32_val(i));
+}
+
+Value shflIdxSync(Location loc, ConversionPatternRewriter &rewriter, Value val,
+                  Value i) {
+  return commonShflSync(loc, rewriter, val, i, NVVM::ShflKind::idx,
+                        i32_val(0x1f));
+}
+
+Value getSRegValue(OpBuilder &b, Location loc, const std::string &sRegStr) {
+  PTXBuilder builder;
+  auto &mov = builder.create("mov")->o("u32");
+  auto *destOpr = builder.newOperand("=r");
+  auto *sRegOpr = builder.newConstantOperand(sRegStr);
+  mov(destOpr, sRegOpr);
+  Value val = builder.launch(b, loc, b.getIntegerType(32), false);
+  return val;
 }
 
 Value addStringToModule(Location loc, ConversionPatternRewriter &rewriter,
@@ -225,11 +362,11 @@ Value addStringToModule(Location loc, ConversionPatternRewriter &rewriter,
   }
 
   Value zero = i32_val(0);
-  Value globalPtr =
-      rewriter.create<LLVM::AddressOfOp>(UnknownLoc::get(ctx), global);
+  Type globalPtrType = LLVM::LLVMPointerType::get(ctx, global.getAddrSpace());
+  Value globalPtr = rewriter.create<LLVM::AddressOfOp>(
+      UnknownLoc::get(ctx), globalPtrType, global.getSymName());
   Value stringStart =
-      rewriter.create<LLVM::GEPOp>(UnknownLoc::get(ctx), ptr_ty(i8_ty),
-                                   globalPtr, SmallVector<Value>({zero, zero}));
+      gep(ptr_ty(ctx), i8_ty, globalPtr, SmallVector<Value>({zero}));
   return stringStart;
 }
 

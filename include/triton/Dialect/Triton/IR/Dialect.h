@@ -10,6 +10,7 @@
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/Dialect.h"
 #include "mlir/Interfaces/ControlFlowInterfaces.h"
+#include "mlir/Interfaces/FunctionInterfaces.h"
 #include "triton/Dialect/Triton/IR/Dialect.h.inc"
 #include "triton/Dialect/Triton/IR/OpsEnums.h.inc"
 #include "triton/Dialect/Triton/IR/Traits.h"

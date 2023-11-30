@@ -1,8 +1,11 @@
-add_mlir_conversion_library(TritonGPUToLLVM
-    TritonGPUToLLVM.cpp
+# Separate out PTX/GCN builders to avoid cyclic dependencies as TritonAnalysis
+# depends on it.
+set(LLVM_OPTIONAL_SOURCES
     GCNAsmFormat.cpp
     PTXAsmFormat.cpp
-    TritonGPUToLLVMPass.cpp
+  )
+
+add_mlir_conversion_library(TritonGPUToLLVM
     ConvertLayoutOpToLLVM/SharedToDotOperandFMA.cpp
     ConvertLayoutOpToLLVM/SharedToDotOperandMMAv1.cpp
     ConvertLayoutOpToLLVM/SharedToDotOperandMMAv2.cpp
@@ -10,17 +13,21 @@ add_mlir_conversion_library(TritonGPUToLLVM
     DotOpToLLVM/FMA.cpp
     DotOpToLLVM/MMAv1.cpp
     DotOpToLLVM/MMAv2.cpp
+    DotOpToLLVM/WGMMA.cpp
     DotOpToLLVM.cpp
     ElementwiseOpToLLVM.cpp
     LoadStoreOpToLLVM.cpp
+    BarrierOpToLLVM.cpp
     TritonGPUToLLVM.cpp
     TritonGPUToLLVMPass.cpp
-    PTXAsmFormat.cpp
     ReduceOpToLLVM.cpp
     ScanOpToLLVM.cpp
-    Utility.cpp
     TypeConverter.cpp
+    Utility.cpp
     ViewOpToLLVM.cpp
+    TensorPtrOpsToLLVM.cpp
+    ClusterOpsToLLVM.cpp
+    RegReallocOpToLLVM.cpp
 
     ADDITIONAL_HEADER_DIRS
     ${PROJECT_SOURCE_DIR}/include/triton/Conversion/TritonGPUToLLVM
@@ -33,9 +40,10 @@ add_mlir_conversion_library(TritonGPUToLLVM
     Core
 
     LINK_LIBS PUBLIC
+    ASMBuilder
     MLIRIR
     MLIRPass
-    MLIRGPUOps
+    MLIRGPUDialect
     MLIRGPUToNVVMTransforms
     MLIRGPUToROCDLTransforms
     MLIRGPUTransforms
@@ -43,4 +51,18 @@ add_mlir_conversion_library(TritonGPUToLLVM
     TritonIR
     TritonGPUIR
     TritonGPUTransforms
+    TritonNvidiaGPUTransforms
+    NVGPUIR
+)
+
+add_mlir_library(ASMBuilder
+  GCNAsmFormat.cpp
+  PTXAsmFormat.cpp
+
+  DEPENDS
+  TritonTableGen
+
+  LINK_LIBS PUBLIC
+  MLIRAnalysis
+  MLIRLLVMDialect
 )

@@ -10,7 +10,16 @@ def default_cache_dir():
     return os.path.join(Path.home(), ".triton", "cache")
 
 
+def default_override_dir():
+    return os.path.join(Path.home(), ".triton", "override")
+
+
+def default_dump_dir():
+    return os.path.join(Path.home(), ".triton", "dump")
+
+
 class CacheManager(ABC):
+
     def __init__(self, key):
         pass
 
@@ -36,22 +45,34 @@ class CacheManager(ABC):
 
 
 class FileCacheManager(CacheManager):
-    def __init__(self, key):
+
+    def __init__(self, key, override=False, dump=False):
         self.key = key
         self.lock_path = None
-        # create cache directory if it doesn't exist
-        self.cache_dir = os.environ.get('TRITON_CACHE_DIR', default_cache_dir())
-        if self.cache_dir:
+        if dump:
+            self.cache_dir = default_dump_dir()
             self.cache_dir = os.path.join(self.cache_dir, self.key)
             self.lock_path = os.path.join(self.cache_dir, "lock")
             os.makedirs(self.cache_dir, exist_ok=True)
+        elif override:
+            self.cache_dir = default_override_dir()
+            self.cache_dir = os.path.join(self.cache_dir, self.key)
+        else:
+            # create cache directory if it doesn't exist
+            self.cache_dir = os.getenv("TRITON_CACHE_DIR", "").strip() or default_cache_dir()
+            if self.cache_dir:
+                self.cache_dir = os.path.join(self.cache_dir, self.key)
+                self.lock_path = os.path.join(self.cache_dir, "lock")
+                os.makedirs(self.cache_dir, exist_ok=True)
+            else:
+                raise RuntimeError("Could not create or locate cache dir")
 
     def _make_path(self, filename) -> str:
         return os.path.join(self.cache_dir, filename)
 
-    def has_file(self, filename):
+    def has_file(self, filename) -> bool:
         if not self.cache_dir:
-            return False
+            raise RuntimeError("Could not create or locate cache dir")
         return os.path.exists(self._make_path(filename))
 
     def get_file(self, filename) -> Optional[str]:
@@ -74,22 +95,21 @@ class FileCacheManager(CacheManager):
         result = {}
         for c in child_paths:
             p = self._make_path(c)
-            if not os.path.exists(p):
-                raise Exception(f"Group file {p} does not exist from group {grp_filename} ")
-            result[c] = p
+            if os.path.exists(p):
+                result[c] = p
         return result
 
     # Note a group of pushed files as being part of a group
-    def put_group(self, filename: str, group: Dict[str, str]):
+    def put_group(self, filename: str, group: Dict[str, str]) -> str:
         if not self.cache_dir:
-            return
+            raise RuntimeError("Could not create or locate cache dir")
         grp_contents = json.dumps({"child_paths": sorted(list(group.keys()))})
         grp_filename = f"__grp__{filename}"
         return self.put(grp_contents, grp_filename, binary=False)
 
     def put(self, data, filename, binary=True) -> str:
         if not self.cache_dir:
-            return
+            raise RuntimeError("Could not create or locate cache dir")
         binary = isinstance(data, bytes)
         if not binary:
             data = str(data)
@@ -123,9 +143,18 @@ def get_cache_manager(key) -> CacheManager:
 
     if user_cache_manager is not None and user_cache_manager != __cache_cls_nme:
         import importlib
+
         module_path, clz_nme = user_cache_manager.split(":")
         module = importlib.import_module(module_path)
         __cache_cls = getattr(module, clz_nme)
         __cache_cls_nme = user_cache_manager
 
     return __cache_cls(key)
+
+
+def get_override_manager(key) -> CacheManager:
+    return __cache_cls(key, override=True)
+
+
+def get_dump_manager(key) -> CacheManager:
+    return __cache_cls(key, dump=True)

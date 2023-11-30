@@ -1,9 +1,9 @@
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/BuiltinTypes.h"
-#include "mlir/IR/FunctionImplementation.h"
-#include "mlir/IR/FunctionInterfaces.h"
 #include "mlir/IR/OperationSupport.h"
+#include "mlir/Interfaces/FunctionImplementation.h"
+#include "mlir/Interfaces/FunctionInterfaces.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/Triton/IR/Types.h"
 
@@ -78,6 +78,16 @@ void LoadOp::print(OpAsmPrinter &printer) {
     printer << " -> ";
   }
   printer.printStrippedAttrOrType(getResult().getType());
+}
+
+void LoadOp::getEffects(
+    SmallVectorImpl<SideEffects::EffectInstance<MemoryEffects::Effect>>
+        &effects) {
+  effects.emplace_back(MemoryEffects::Read::get(), getPtr(),
+                       SideEffects::DefaultResource::get());
+  if (getIsVolatile())
+    effects.emplace_back(MemoryEffects::Write::get(),
+                         SideEffects::DefaultResource::get());
 }
 
 ParseResult StoreOp::parse(OpAsmParser &parser, OperationState &result) {
@@ -401,8 +411,10 @@ mlir::LogicalResult mlir::triton::DotOp::inferReturnTypes(
 LogicalResult mlir::triton::DotOp::verify() {
   auto aTy = getOperand(0).getType().cast<RankedTensorType>();
   auto bTy = getOperand(1).getType().cast<RankedTensorType>();
-  if (aTy.getElementType() != bTy.getElementType())
-    return emitError("element types of operands A and B must match");
+  if (aTy.getElementType().getIntOrFloatBitWidth() !=
+      bTy.getElementType().getIntOrFloatBitWidth())
+    return emitError(
+        "element types of operands A and B must have same bit width");
   auto aEncoding = aTy.getEncoding();
   auto bEncoding = bTy.getEncoding();
   if (!aEncoding && !bEncoding)
@@ -414,6 +426,41 @@ LogicalResult mlir::triton::DotOp::verify() {
   auto interface = cast<DialectInferLayoutInterface>(&dialect);
   return interface->verifyDotOpEncodingCompatibility(getOperation(), aEncoding,
                                                      bEncoding);
+}
+
+//-- MakeRangeOp --
+OpFoldResult MakeRangeOp::fold(FoldAdaptor adaptor) {
+  // make_range(start, start + 1) -> constant(start)
+  if (adaptor.getStart() + 1 == adaptor.getEnd()) {
+    auto shapedType = getType().cast<ShapedType>();
+    return SplatElementsAttr::get(shapedType, adaptor.getStartAttr());
+  }
+  return {};
+}
+
+LogicalResult MakeRangeOp::verify() {
+  int64_t start = getStartAttr().getInt();
+  int64_t end = getEndAttr().getInt();
+  if (start > end) {
+    return this->emitOpError() << "start must be less than or equal to end";
+  }
+  auto ty = getType().dyn_cast<RankedTensorType>();
+  if (!ty) {
+    return this->emitOpError() << "return type must be a ranked tensor";
+  }
+  if (ty.getShape().size() != 1) {
+    return this->emitOpError() << "return type must be a 1D tensor";
+  }
+  if (end - start != ty.getShape()[0]) {
+    return this->emitOpError()
+           << "number of elements in returned tensor, " << ty.getShape()[0]
+           << ", must match size of range [" << start << ", " << end
+           << "), which has " << end - start << " elements";
+  }
+  if (!ty.getElementType().isInteger(32)) {
+    return this->emitOpError() << "returned tensor must have i32 elements";
+  }
+  return success();
 }
 
 //-- ReduceOp --
@@ -687,7 +734,7 @@ OpFoldResult ExpandDimsOp::fold(FoldAdaptor adaptor) {
   return foldViewLikeOp(*this, adaptor.getSrc());
 }
 
-//-- ViewOp --
+//-- ReshapeOp --
 template <typename OpType>
 LogicalResult canonicalizeViewOrBroadcast(OpType op,
                                           PatternRewriter &rewriter) {
@@ -697,9 +744,10 @@ LogicalResult canonicalizeViewOrBroadcast(OpType op,
   }
 
   // view(view) -> view
-  if (auto parent_view = dyn_cast<OpType>(definingOp)) {
-    rewriter.replaceOpWithNewOp<OpType>(op, op.getType(),
-                                        parent_view.getOperand());
+  if (auto parentView = dyn_cast<OpType>(definingOp)) {
+    rewriter.replaceOpWithNewOp<OpType>(op, TypeRange({op.getType()}),
+                                        parentView->getOperands(),
+                                        parentView->getAttrs());
     return mlir::success();
   }
 
@@ -712,17 +760,30 @@ LogicalResult canonicalizeViewOrBroadcast(OpType op,
 
   return mlir::failure();
 }
-LogicalResult ViewOp::canonicalize(ViewOp op, PatternRewriter &rewriter) {
+
+LogicalResult ReshapeOp::canonicalize(ReshapeOp op, PatternRewriter &rewriter) {
+  if (!op.getAllowReorder())
+    return failure();
   return canonicalizeViewOrBroadcast(op, rewriter);
 }
 
-OpFoldResult ViewOp::fold(FoldAdaptor adaptor) {
+OpFoldResult ReshapeOp::fold(FoldAdaptor adaptor) {
   if (getType() == getOperand().getType()) {
     // no-op
     return getOperand();
   }
 
   return foldViewLikeOp(*this, adaptor.getSrc());
+}
+
+mlir::LogicalResult mlir::triton::ReshapeOp::verify() {
+  auto dstType = getType().cast<RankedTensorType>();
+  auto srcType = getSrc().getType().cast<RankedTensorType>();
+  if (dstType.getNumElements() != srcType.getNumElements()) {
+    return emitError(
+        "number of src and dst elements of reshape must be the same");
+  }
+  return mlir::success();
 }
 
 //-- BroadcastOp --
@@ -868,6 +929,30 @@ LogicalResult triton::ReturnOp::verify() {
                          << " in function @" << function.getName();
 
   return success();
+}
+
+// -- ElementwiseInlineAsmOp --
+void ElementwiseInlineAsmOp::getEffects(
+    SmallVectorImpl<SideEffects::EffectInstance<MemoryEffects::Effect>>
+        &effects) {
+  if (getPure())
+    return;
+  effects.emplace_back(MemoryEffects::Write::get(),
+                       SideEffects::DefaultResource::get());
+  effects.emplace_back(MemoryEffects::Read::get(),
+                       SideEffects::DefaultResource::get());
+}
+
+// -- ExternElementwiseOp --
+void ExternElementwiseOp::getEffects(
+    SmallVectorImpl<SideEffects::EffectInstance<MemoryEffects::Effect>>
+        &effects) {
+  if (getPure())
+    return;
+  effects.emplace_back(MemoryEffects::Write::get(),
+                       SideEffects::DefaultResource::get());
+  effects.emplace_back(MemoryEffects::Read::get(),
+                       SideEffects::DefaultResource::get());
 }
 
 } // namespace triton

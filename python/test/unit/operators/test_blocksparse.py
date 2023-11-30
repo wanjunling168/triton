@@ -68,8 +68,7 @@ def test_matmul(MODE, TRANS_A, TRANS_B, BLOCK, DTYPE, Z=3, H=2, M=512, N=384, K=
     b_ref = do_mask(b_ref) if is_dds else b_ref
     a_ref.retain_grad()
     b_ref.retain_grad()
-    c_ref = torch.matmul(a_ref.transpose(2, 3) if TRANS_A else a_ref,
-                         b_ref.transpose(2, 3) if TRANS_B else b_ref)
+    c_ref = torch.matmul(a_ref.transpose(2, 3) if TRANS_A else a_ref, b_ref.transpose(2, 3) if TRANS_B else b_ref)
     c_ref.backward(dc_ref)
     c_ref = do_sparsify(c_ref) if is_sdd else c_ref
     da_ref = do_sparsify(a_ref.grad) if is_dsd else a_ref.grad
@@ -86,9 +85,9 @@ def test_matmul(MODE, TRANS_A, TRANS_B, BLOCK, DTYPE, Z=3, H=2, M=512, N=384, K=
     da_tri = a_tri.grad
     db_tri = b_tri.grad
     # compare
-    torch.testing.assert_allclose(c_ref, c_tri)
-    torch.testing.assert_allclose(da_ref, da_tri)
-    torch.testing.assert_allclose(db_ref, db_tri)
+    torch.testing.assert_close(c_ref, c_tri)
+    torch.testing.assert_close(da_ref, da_tri)
+    torch.testing.assert_close(db_ref, db_tri)
 
 
 configs = [
@@ -138,8 +137,8 @@ def test_softmax(BLOCK, WIDTH, is_dense, Z=2, H=2, is_causal=True, scale=0.4):
     out_tri.backward(dout_tri)
     da_tri = a_tri.grad
     # compare
-    torch.testing.assert_allclose(out_tri, out_ref)
-    torch.testing.assert_allclose(da_tri, da_ref)
+    torch.testing.assert_close(out_tri, out_ref, equal_nan=True)
+    torch.testing.assert_close(da_tri, da_ref, equal_nan=True)
 
 
 @pytest.mark.parametrize("block", [16, 32, 64])
@@ -172,7 +171,7 @@ def test_attention_fwd_bwd(
     value.retain_grad()
     attn_out = triton_attention(layout, block, query=query, key=key, value=value, scale=scale)
     # ad hoc loss
-    loss = (attn_out ** 2).mean()
+    loss = (attn_out**2).mean()
     loss.backward()
     grads = [query.grad, key.grad, value.grad]
 
@@ -189,15 +188,15 @@ def test_attention_fwd_bwd(
     probs = torch.softmax(scores, dim=-1)
     torch_attn_out = torch.einsum("bhst,bhtd->bhsd", probs, torch_v)
     # ad hoc loss
-    torch_loss = (torch_attn_out ** 2).mean()
+    torch_loss = (torch_attn_out**2).mean()
     torch_loss.backward()
     torch_grads = [torch_q.grad, torch_k.grad, torch_v.grad]
 
     # comparison
     # print(f"Triton loss {loss} and torch loss {torch_loss}.  Also checking grads...")
-    torch.testing.assert_allclose(loss, torch_loss, atol=1e-3, rtol=0)
+    torch.testing.assert_close(loss, torch_loss, atol=1e-3, rtol=0)
     for g1, g2 in zip(grads, torch_grads):
-        torch.testing.assert_allclose(g1, g2)
+        torch.testing.assert_close(g1, g2)
 
 
 @pytest.mark.parametrize("block", [16, 32, 64])
@@ -209,8 +208,10 @@ def triton_attention(
     value: torch.Tensor,
     scale: float,
 ):
-    sparse_dot_sdd_nt = triton.ops.blocksparse.matmul(layout, block, "sdd", trans_a=False, trans_b=True, device=value.device)
-    sparse_dot_dsd_nn = triton.ops.blocksparse.matmul(layout, block, "dsd", trans_a=False, trans_b=False, device=value.device)
+    sparse_dot_sdd_nt = triton.ops.blocksparse.matmul(layout, block, "sdd", trans_a=False, trans_b=True,
+                                                      device=value.device)
+    sparse_dot_dsd_nn = triton.ops.blocksparse.matmul(layout, block, "dsd", trans_a=False, trans_b=False,
+                                                      device=value.device)
     sparse_softmax = triton.ops.blocksparse.softmax(layout, block, device=value.device)
 
     w = sparse_dot_sdd_nt(query, key)

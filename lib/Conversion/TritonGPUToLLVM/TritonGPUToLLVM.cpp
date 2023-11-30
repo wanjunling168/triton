@@ -2,12 +2,32 @@
 #include "Utility.h"
 #include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
 
+namespace {
+
 using namespace mlir;
 using namespace mlir::triton;
 
 using ::mlir::LLVM::getSharedMemoryObjectFromStruct;
+using ::mlir::LLVM::getSRegValue;
 using ::mlir::triton::gpu::getTotalElemsPerThread;
 using ::mlir::triton::gpu::SharedEncodingAttr;
+
+Value llGetPid(int axis, Location loc, ModuleOp moduleOp,
+               ConversionPatternRewriter &rewriter) {
+  assert(axis >= 0);
+  assert(axis < 3);
+  assert(moduleOp);
+
+  // It is not easy to get the compute capability here, so we use numCTAs to
+  // decide the semantic of GetProgramIdOp. If numCTAs = 1, then
+  // GetProgramIdOp is converted to "%ctaid", otherwise it is converted to
+  // "%clusterid".
+  int numCTAs = triton::gpu::TritonGPUDialect::getNumCTAs(moduleOp);
+
+  std::string sreg = numCTAs == 1 ? "%ctaid." : "%clusterid.";
+  sreg.append(1, 'x' + axis); // 0 -> 'x', 1 -> 'y', 2 -> 'z'
+  return getSRegValue(rewriter, loc, sreg);
+}
 
 struct ReturnOpConversion : public ConvertOpToLLVMPattern<triton::ReturnOp> {
   using ConvertOpToLLVMPattern<triton::ReturnOp>::ConvertOpToLLVMPattern;
@@ -90,6 +110,12 @@ struct BroadcastOpConversion
   }
 };
 
+// The input print op contains:
+//  - a "prefix" (string) specified by the user, and
+//  - one or more "operands" (tensors).
+//
+// For each operand, we print all of the values contained in this GPU thread,
+// one per line, along with the index of the value in its tensor.
 struct PrintOpConversion
     : public ConvertTritonGPUOpToLLVMPattern<triton::PrintOp> {
   using ConvertTritonGPUOpToLLVMPattern<
@@ -99,45 +125,170 @@ struct PrintOpConversion
   matchAndRewrite(triton::PrintOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
     auto loc = op->getLoc();
-    SmallVector<Value, 16> operands;
-    for (size_t i = 0; i < op.getNumOperands(); i++) {
-      auto sub_operands = getTypeConverter()->unpackLLElements(
-          loc, adaptor.getOperands()[i], rewriter, op.getOperand(i).getType());
-      for (auto elem : sub_operands) {
-        operands.push_back(elem);
+    Value prefixStr =
+        LLVM::addStringToModule(loc, rewriter, "printfPrefix_", op.getPrefix());
+
+    auto getPid = [&](int axis) {
+      return llGetPid(axis, loc, op->getParentOfType<ModuleOp>(), rewriter);
+    };
+    std::array<Value, 3> pid = {getPid(0), getPid(1), getPid(2)};
+
+    // Simple printf of a string without any tensors.
+    if (op.getNumOperands() == 0) {
+      std::string formatStr;
+      llvm::raw_string_ostream os(formatStr);
+      os << "pid (" << getFormatSubstr(pid[0]) << ", "
+         << getFormatSubstr(pid[1]) << ", " << getFormatSubstr(pid[2]) << ")%s";
+      llPrintf(formatStr, {pid[0], pid[1], pid[2], prefixStr}, rewriter);
+    } else {
+      for (size_t i = 0; i < op.getNumOperands(); i++) {
+        // Elements of the tensor that are resident in this GPU thread.
+        auto elems = getTypeConverter()->unpackLLElements(
+            loc, adaptor.getOperands()[i], rewriter,
+            op.getOperand(i).getType());
+
+        // Get the indices of `elems` within the tensor.  Note that if `elems`
+        // has an "interesting" layout, then these will not be in any
+        // particularly nice order.
+
+        // Extract the shape of the tensor being printed and use it to figure
+        // out how many digits we need for each of the dimensions.
+        SmallVector<int, 8> dimWidths;
+        SmallVector<SmallVector<Value>> indices;
+        if (auto rankedTy =
+                op.getOperand(i).getType().dyn_cast<RankedTensorType>()) {
+          indices =
+              emitIndices(loc, rewriter, rankedTy.getEncoding(), rankedTy);
+          for (int64_t dim : rankedTy.getShape()) {
+            if (dim > 0) {
+              dimWidths.push_back(static_cast<int>(std::ceil(std::log10(dim))));
+            } else {
+              dimWidths.push_back(0);
+            }
+          }
+        } else {
+          // We're printing a scalar.
+          assert(elems.size() == 1);
+          indices.push_back({});
+        }
+
+        if (!elems.empty()) {
+          printTensor(prefixStr, /*operand=*/i,
+                      /*numOperands=*/op.getNumOperands(), elems, pid, indices,
+                      dimWidths, rewriter);
+        }
       }
     }
-    std::string formatStr;
-    llvm::raw_string_ostream os(formatStr);
-    os << op.getPrefix();
-    if (!operands.empty()) {
-      os << getFormatSubstr(operands[0]);
-    }
-
-    for (size_t i = 1; i < operands.size(); ++i) {
-      os << ", " << getFormatSubstr(operands[i]);
-    }
-    llPrintf(formatStr, operands, rewriter);
     rewriter.eraseOp(op);
     return success();
   }
 
-  std::string getFormatSubstr(Value value) const {
+  void printTensor(Value prefixStr, size_t operand, size_t numOperands,
+                   ArrayRef<Value> elems, std::array<Value, 3> pid,
+                   ArrayRef<SmallVector<Value>> indices,
+                   ArrayRef<int> dimWidths,
+                   ConversionPatternRewriter &rewriter) const {
+    assert(!elems.empty());
+    assert(elems.size() == indices.size());
+    assert(dimWidths.size() == indices.front().size());
+
+    size_t rank = dimWidths.size();
+
+    // Format is:
+    //   pid (<x>, <y>, <z>) idx (<i1>, <i2>, ...)<prefix> (operand <n>) <elem>
+    // where we leave off "(operand <n>)" if there's only one operand.
+    //
+    // The Python wrapper munges `prefix` so that it prints nicely (e.g. starts
+    // with " " and ends with ": ").
+
+    Value formatStrValue;
+    for (int i = 0; i < elems.size(); i++) {
+      std::string formatStr;
+      llvm::raw_string_ostream os(formatStr);
+
+      // nvptx printf can only accept 32 args; if we pass more than that, it
+      // will print garbage for the trailing args.
+      constexpr int kMaxPrintfOperands = 32;
+      SmallVector<Value, kMaxPrintfOperands> printfOperands;
+
+      // TODO(jlebar): We really should pad the pid, but because the max pid is
+      // not known at compile-time, this would require nontrivial device-side
+      // work.
+      os << "pid (";
+      for (int j = 0; j < pid.size(); j++) {
+        if (j != 0) {
+          os << ", ";
+        }
+        os << getFormatSubstr(pid[j]);
+        printfOperands.push_back(pid[j]);
+      }
+      os << ") ";
+
+      // If `rank` is large enough, we could end up exceeding
+      // kMaxPrintfOperands.  In that case, just truncate the index.
+      // (Subtract 2 because we're going to add two operands after the index.)
+      int maxAllowedRank = kMaxPrintfOperands - printfOperands.size() - 2;
+
+      os << "idx (";
+      const auto &index = indices[i];
+      for (size_t dim = 0; dim < index.size(); dim++) {
+        if (dim != 0) {
+          os << ", ";
+        }
+        if (dim == maxAllowedRank) {
+          os << "... (truncated)";
+          break;
+        }
+        os << getFormatSubstr(index[dim], /*width=*/dimWidths[dim]);
+        printfOperands.push_back(index[dim]);
+      }
+      os << ")";
+
+      os << "%s";
+      printfOperands.push_back(prefixStr);
+
+      if (numOperands > 1) {
+        os << "(operand " << operand << ") ";
+      }
+
+      auto elem = elems[i];
+      os << getFormatSubstr(elem);
+      printfOperands.push_back(elem);
+
+      // It's the same format string each iteration, but it's a lot easier if we
+      // construct the format string at the same time as we populate
+      // printfOperands.  But we don't want to create BLOCK_SIZE duplicate
+      // strings, so we cache the Value.
+      if (i == 0) {
+        formatStrValue = llPrintf(formatStr, printfOperands, rewriter);
+      } else {
+        llPrintf(formatStrValue, printfOperands, rewriter);
+      }
+    }
+  }
+
+  std::string getFormatSubstr(Value value,
+                              std::optional<int> width = std::nullopt) const {
+    std::string prefix = "%";
+    if (width.has_value()) {
+      prefix += std::to_string(*width);
+    }
+
     Type type = value.getType();
     if (type.isa<LLVM::LLVMPointerType>()) {
-      return "%p";
+      return prefix + "p";
     } else if (type.isBF16() || type.isF16() || type.isF32() || type.isF64()) {
-      return "%f";
+      return prefix + "f";
     } else if (type.isSignedInteger()) {
       if (type.getIntOrFloatBitWidth() == 64)
-        return "%lli";
+        return prefix + "lli";
       else
-        return "%i";
+        return prefix + "i";
     } else if (type.isUnsignedInteger() || type.isSignlessInteger()) {
       if (type.getIntOrFloatBitWidth() == 64)
-        return "%llu";
+        return prefix + "llu";
       else
-        return "%u";
+        return prefix + "u";
     }
     assert(false && "not supported type");
     return "";
@@ -155,8 +306,7 @@ struct PrintOpConversion
 
     auto *context = rewriter.getContext();
 
-    SmallVector<Type> argsType{ptr_ty(IntegerType::get(context, 8)),
-                               ptr_ty(IntegerType::get(context, 8))};
+    SmallVector<Type> argsType{ptr_ty(context), ptr_ty(context)};
     auto funcType = LLVM::LLVMFunctionType::get(i32_ty, argsType);
 
     ConversionPatternRewriter::InsertionGuard guard(rewriter);
@@ -193,12 +343,24 @@ struct PrintOpConversion
     return {newType, newOp};
   }
 
-  static void llPrintf(StringRef msg, ValueRange args,
-                       ConversionPatternRewriter &rewriter) {
-    assert(!msg.empty() && "printf with empty string not support");
-    Type int8Ptr = ptr_ty(i8_ty);
+  // Returns a Value for the format string, which you can reuse.
+  static Value llPrintf(StringRef msg, ValueRange args,
+                        ConversionPatternRewriter &rewriter) {
+    assert(!msg.empty() && "printf with empty string not supported");
+    llvm::SmallString<64> msgNewline(msg);
+    msgNewline.push_back('\n');
+    msgNewline.push_back('\0');
+    Value msgValue =
+        LLVM::addStringToModule(UnknownLoc::get(rewriter.getContext()),
+                                rewriter, "printfFormat_", msgNewline);
+    llPrintf(msgValue, args, rewriter);
+    return msgValue;
+  }
 
+  static void llPrintf(Value msg, ValueRange args,
+                       ConversionPatternRewriter &rewriter) {
     auto *ctx = rewriter.getContext();
+    Type ptr = ptr_ty(ctx);
     auto moduleOp =
         rewriter.getBlock()->getParent()->getParentOfType<ModuleOp>();
     auto funcOp = getVprintfDeclaration(rewriter);
@@ -207,12 +369,7 @@ struct PrintOpConversion
     Value one = i32_val(1);
     Value zero = i32_val(0);
 
-    llvm::SmallString<64> msgNewline(msg);
-    msgNewline.push_back('\n');
-    msgNewline.push_back('\0');
-    Value prefixString =
-        LLVM::addStringToModule(loc, rewriter, "printfFormat_", msgNewline);
-    Value bufferPtr = null(int8Ptr);
+    Value bufferPtr = null(ptr);
 
     SmallVector<Value, 16> newArgs;
     if (args.size() >= 1) {
@@ -227,19 +384,19 @@ struct PrintOpConversion
 
       Type structTy = LLVM::LLVMStructType::getLiteral(ctx, argTypes);
       auto allocated =
-          rewriter.create<LLVM::AllocaOp>(loc, ptr_ty(structTy), one,
+          rewriter.create<LLVM::AllocaOp>(loc, ptr_ty(ctx), structTy, one,
                                           /*alignment=*/0);
 
       for (const auto &entry : llvm::enumerate(newArgs)) {
         auto index = i32_val(entry.index());
-        auto fieldPtr = gep(ptr_ty(argTypes[entry.index()]), allocated,
-                            ArrayRef<Value>{zero, index});
+        auto fieldPtr =
+            gep(ptr_ty(ctx), structTy, allocated, ArrayRef<Value>{zero, index});
         store(entry.value(), fieldPtr);
       }
-      bufferPtr = bitcast(allocated, int8Ptr);
+      bufferPtr = bitcast(allocated, ptr);
     }
 
-    SmallVector<Value> operands{prefixString, bufferPtr};
+    SmallVector<Value> operands{msg, bufferPtr};
     call(funcOp, operands);
   }
 };
@@ -330,8 +487,7 @@ struct AssertOpConversion
     // void __assert_fail(const char * assertion, const char * file, unsigned
     // int line, const char * function);
     auto *ctx = rewriter.getContext();
-    SmallVector<Type> argsType{ptr_ty(i8_ty), ptr_ty(i8_ty), i32_ty,
-                               ptr_ty(i8_ty),
+    SmallVector<Type> argsType{ptr_ty(ctx), ptr_ty(ctx), i32_ty, ptr_ty(ctx),
                                rewriter.getIntegerType(sizeof(size_t) * 8)};
     auto funcType = LLVM::LLVMFunctionType::get(void_ty(ctx), argsType);
 
@@ -389,18 +545,11 @@ struct GetProgramIdOpConversion
   LogicalResult
   matchAndRewrite(triton::GetProgramIdOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
-    Location loc = op->getLoc();
-    assert(op.getAxisAsInt() < 3);
-
-    Value blockId =
-        rewriter.create<::mlir::gpu::BlockIdOp>(loc, dims[op.getAxisAsInt()]);
-    rewriter.replaceOpWithNewOp<arith::IndexCastOp>(op, i32_ty, blockId);
+    Value programId = llGetPid(op.getAxisAsInt(), op->getLoc(),
+                               op->getParentOfType<ModuleOp>(), rewriter);
+    rewriter.replaceOp(op, programId);
     return success();
   }
-
-  static constexpr mlir::gpu::Dimension dims[] = {mlir::gpu::Dimension::x,
-                                                  mlir::gpu::Dimension::y,
-                                                  mlir::gpu::Dimension::z};
 };
 
 struct GetNumProgramsOpConversion
@@ -411,19 +560,68 @@ struct GetNumProgramsOpConversion
   LogicalResult
   matchAndRewrite(triton::GetNumProgramsOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
+    // It is not easy to get the compute capability here, so we use numCTAs to
+    // decide the semantic of GetNumProgramsOp. If numCTAs = 1, then
+    // GetNumProgramsOp is converted to "%nctaid", otherwise it is converted to
+    // "%nclusterid".
+    auto moduleOp = op->getParentOfType<ModuleOp>();
+    assert(moduleOp && "Parent ModuleOp not found for GetProgramIdOp");
+    int numCTAs = triton::gpu::TritonGPUDialect::getNumCTAs(moduleOp);
+
     Location loc = op->getLoc();
     assert(op.getAxis() < 3);
+    std::string sreg = numCTAs == 1 ? "%nctaid." : "%nclusterid.";
+    sreg.append(1, 'x' + op.getAxis()); // 0 -> 'x', 1 -> 'y', 2 -> 'z'
 
-    Value blockId =
-        rewriter.create<::mlir::gpu::GridDimOp>(loc, dims[op.getAxis()]);
-    rewriter.replaceOpWithNewOp<arith::IndexCastOp>(op, i32_ty, blockId);
-
+    Value numPrograms = getSRegValue(rewriter, loc, sreg);
+    rewriter.replaceOp(op, numPrograms);
     return success();
   }
+};
 
-  static constexpr mlir::gpu::Dimension dims[] = {mlir::gpu::Dimension::x,
-                                                  mlir::gpu::Dimension::y,
-                                                  mlir::gpu::Dimension::z};
+// TODO[goostavz]: GetThreadIdOp/GetClusterCTAIdOp is a temporary solution
+// before async dialect is done. These concepts should appear in ttgpu
+// level, and they are planned to be deprecated along with ttgpu.mbarrier_xxx
+// ops.
+struct GetThreadIdOpConversion : public ConvertTritonGPUOpToLLVMPattern<
+                                     triton::nvidia_gpu::GetThreadIdOp> {
+  using ConvertTritonGPUOpToLLVMPattern<
+      triton::nvidia_gpu::GetThreadIdOp>::ConvertTritonGPUOpToLLVMPattern;
+
+  LogicalResult
+  matchAndRewrite(triton::nvidia_gpu::GetThreadIdOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    rewriter.replaceOp(op, getThreadId(rewriter, op->getLoc()));
+    return success();
+  }
+};
+
+struct GetCanonicalWarpIdConversion
+    : public ConvertTritonGPUOpToLLVMPattern<
+          triton::nvidia_gpu::GetCanonicalWarpId> {
+  using ConvertTritonGPUOpToLLVMPattern<
+      triton::nvidia_gpu::GetCanonicalWarpId>::ConvertTritonGPUOpToLLVMPattern;
+
+  LogicalResult
+  matchAndRewrite(triton::nvidia_gpu::GetCanonicalWarpId op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    rewriter.replaceOp(op, GetCanonicalWarpId(rewriter, op->getLoc()));
+    return success();
+  }
+};
+
+struct GetClusterCTAIdOpConversion
+    : public ConvertTritonGPUOpToLLVMPattern<
+          triton::nvidia_gpu::GetClusterCTAIdOp> {
+  using ConvertTritonGPUOpToLLVMPattern<
+      triton::nvidia_gpu::GetClusterCTAIdOp>::ConvertTritonGPUOpToLLVMPattern;
+
+  LogicalResult
+  matchAndRewrite(triton::nvidia_gpu::GetClusterCTAIdOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    rewriter.replaceOp(op, getClusterCTAId(rewriter, op->getLoc()));
+    return success();
+  }
 };
 
 struct AddPtrOpConversion
@@ -437,11 +635,14 @@ struct AddPtrOpConversion
     Location loc = op->getLoc();
     auto resultTy = op.getType();
     auto offsetTy = op.getOffset().getType();
-    auto ptrTy = op.getPtr().getType();
     auto resultTensorTy = resultTy.dyn_cast<RankedTensorType>();
     if (resultTensorTy) {
       unsigned elems = getTotalElemsPerThread(resultTy);
       Type elemTy =
+          getTypeConverter()->convertType(resultTensorTy.getElementType()
+                                              .cast<triton::PointerType>()
+                                              .getPointeeType());
+      Type ptrTy =
           getTypeConverter()->convertType(resultTensorTy.getElementType());
       auto ptrs = getTypeConverter()->unpackLLElements(loc, adaptor.getPtr(),
                                                        rewriter, ptrTy);
@@ -449,15 +650,18 @@ struct AddPtrOpConversion
           loc, adaptor.getOffset(), rewriter, offsetTy);
       SmallVector<Value> resultVals(elems);
       for (unsigned i = 0; i < elems; ++i) {
-        resultVals[i] = gep(elemTy, ptrs[i], offsets[i]);
+        resultVals[i] = gep(ptrTy, elemTy, ptrs[i], offsets[i]);
       }
       Value view = getTypeConverter()->packLLElements(loc, resultVals, rewriter,
                                                       resultTy);
       rewriter.replaceOp(op, view);
     } else {
       assert(resultTy.isa<triton::PointerType>());
-      Type llResultTy = getTypeConverter()->convertType(resultTy);
-      Value result = gep(llResultTy, adaptor.getPtr(), adaptor.getOffset());
+      auto resultPtrTy = getTypeConverter()->convertType(resultTy);
+      auto resultElemTy = getTypeConverter()->convertType(
+          resultTy.cast<triton::PointerType>().getPointeeType());
+      Value result =
+          gep(resultPtrTy, resultElemTy, adaptor.getPtr(), adaptor.getOffset());
       rewriter.replaceOp(op, result);
     }
     return success();
@@ -475,22 +679,27 @@ struct AllocTensorOpConversion
     Location loc = op->getLoc();
     Value smemBase = getSharedMemoryBase(loc, rewriter, op.getResult());
     auto resultTy = op.getType().dyn_cast<RankedTensorType>();
-    auto llvmElemTy =
-        getTypeConverter()->convertType(resultTy.getElementType());
-    auto elemPtrTy = ptr_ty(llvmElemTy, 3);
+    auto elemPtrTy = ptr_ty(rewriter.getContext(), 3);
     smemBase = bitcast(smemBase, elemPtrTy);
-    auto order = resultTy.getEncoding().cast<SharedEncodingAttr>().getOrder();
+    auto sharedLayout = resultTy.getEncoding().cast<SharedEncodingAttr>();
+    auto order = sharedLayout.getOrder();
     // Workaround for 3D tensors
     // TODO: we need to modify the pipeline pass to give a proper shared
     // encoding to 3D tensors
     SmallVector<unsigned> newOrder;
-    if (resultTy.getShape().size() == 3)
-      newOrder = {1 + order[0], 1 + order[1], 0};
-    else
+    if (resultTy.getShape().size() != order.size()) {
+      for (auto i = 0; i < order.size(); ++i)
+        newOrder.push_back(order[i] + 1);
+      newOrder.push_back(0);
+    } else {
       newOrder = SmallVector<unsigned>(order.begin(), order.end());
+    }
 
-    auto smemObj = SharedMemoryObject(smemBase, resultTy.getShape(), newOrder,
-                                      loc, rewriter);
+    auto llvmElemTy =
+        getTypeConverter()->convertType(resultTy.getElementType());
+    auto shapePerCTA = getShapePerCTA(sharedLayout, resultTy.getShape());
+    auto smemObj = SharedMemoryObject(smemBase, llvmElemTy, shapePerCTA,
+                                      newOrder, loc, rewriter);
     auto retVal = getStructFromSharedMemoryObject(loc, smemObj, rewriter);
     rewriter.replaceOp(op, retVal);
     return success();
@@ -513,17 +722,22 @@ struct ExtractSliceOpConversion
     assert(op.hasUnitStride() &&
            "Only unit stride supported by ExtractSliceOpConversion");
 
+    auto llvmElemTy = getTypeConverter()->convertType(srcTy.getElementType());
+
     // newBase = base + offset
     // Triton supports either static and dynamic offsets
-    auto smemObj =
-        getSharedMemoryObjectFromStruct(loc, adaptor.getSource(), rewriter);
+    auto smemObj = getSharedMemoryObjectFromStruct(loc, adaptor.getSource(),
+                                                   llvmElemTy, rewriter);
     SmallVector<Value, 4> opOffsetVals;
     SmallVector<Value, 4> offsetVals;
     auto mixedOffsets = op.getMixedOffsets();
-    for (auto i = 0; i < mixedOffsets.size(); ++i) {
-      if (op.isDynamicOffset(i))
-        opOffsetVals.emplace_back(adaptor.getOffsets()[i]);
-      else
+    for (auto i = 0, j = 0; i < mixedOffsets.size(); ++i) {
+      if (op.isDynamicOffset(i)) {
+        // adaptor.getOffsets() returns list of variable offsets. the size of
+        // the list may not be the same as mixedOffsets
+        opOffsetVals.emplace_back(adaptor.getOffsets()[j]);
+        ++j;
+      } else
         opOffsetVals.emplace_back(i32_val(op.getStaticOffset(i)));
       offsetVals.emplace_back(add(smemObj.offsets[i], opOffsetVals[i]));
     }
@@ -533,7 +747,7 @@ struct ExtractSliceOpConversion
     // newShape = rank_reduce(shape)
     // Triton only supports static tensor sizes
     SmallVector<Value, 4> strideVals;
-    for (auto i = 0; i < op.static_sizes().size(); ++i) {
+    for (auto i = 0; i < op.getStaticSizes().size(); ++i) {
       if (op.getStaticSize(i) == 1) {
         offsetVals.erase(offsetVals.begin() + i);
       } else {
@@ -541,10 +755,10 @@ struct ExtractSliceOpConversion
       }
     }
 
-    auto llvmElemTy = getTypeConverter()->convertType(srcTy.getElementType());
-    auto elemPtrTy = ptr_ty(llvmElemTy, 3);
-    smemObj = SharedMemoryObject(gep(elemPtrTy, smemObj.base, offset),
-                                 strideVals, offsetVals);
+    auto elemPtrTy = ptr_ty(rewriter.getContext(), 3);
+    smemObj =
+        SharedMemoryObject(gep(elemPtrTy, llvmElemTy, smemObj.base, offset),
+                           llvmElemTy, strideVals, offsetVals);
     auto retVal = getStructFromSharedMemoryObject(loc, smemObj, rewriter);
     rewriter.replaceOp(op, retVal);
     return success();
@@ -593,31 +807,56 @@ struct AsyncCommitGroupOpConversion
   }
 };
 
-namespace mlir {
-namespace LLVM {
+struct AsyncBulkWaitOpConversion
+    : public ConvertTritonGPUOpToLLVMPattern<triton::gpu::AsyncBulkWaitOp> {
+  using ConvertTritonGPUOpToLLVMPattern<
+      triton::gpu::AsyncBulkWaitOp>::ConvertTritonGPUOpToLLVMPattern;
 
-void vprintf(StringRef msg, ValueRange args,
-             ConversionPatternRewriter &rewriter) {
-  PrintOpConversion::llPrintf(msg, args, rewriter);
-}
+  LogicalResult
+  matchAndRewrite(triton::gpu::AsyncBulkWaitOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    PTXBuilder ptxBuilder;
+    auto &asyncBulkWaitOp = *ptxBuilder.create<>("cp.async.bulk.wait_group");
+    auto num = op->getAttrOfType<IntegerAttr>("num").getInt();
+    asyncBulkWaitOp(ptxBuilder.newConstantOperand(num));
 
-void vprintf_array(Value thread, ArrayRef<Value> arr, std::string info,
-                   std::string elem_repr, ConversionPatternRewriter &builder) {
-  std::string fmt = info + " t-%d ";
-  std::vector<Value> new_arr({thread});
-  for (int i = 0; i < arr.size(); ++i) {
-    fmt += elem_repr + ((i == arr.size() - 1) ? "" : ", ");
-    new_arr.push_back(arr[i]);
+    auto ctx = op.getContext();
+    auto loc = op.getLoc();
+    auto voidTy = void_ty(ctx);
+    ptxBuilder.launch(rewriter, loc, voidTy);
+
+    // Safe to remove the op since it doesn't have any return value.
+    rewriter.eraseOp(op);
+    return success();
   }
+};
 
-  vprintf(fmt, new_arr, builder);
-}
+struct AsyncBulkCommitGroupOpConversion
+    : public ConvertTritonGPUOpToLLVMPattern<
+          triton::gpu::AsyncBulkCommitGroupOp> {
+  using ConvertTritonGPUOpToLLVMPattern<
+      triton::gpu::AsyncBulkCommitGroupOp>::ConvertTritonGPUOpToLLVMPattern;
 
-} // namespace LLVM
-} // namespace mlir
+  LogicalResult
+  matchAndRewrite(triton::gpu::AsyncBulkCommitGroupOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+
+    PTXBuilder ptxBuilder;
+    ptxBuilder.create<>("cp.async.bulk.commit_group")->operator()();
+    ptxBuilder.launch(rewriter, op.getLoc(), void_ty(op.getContext()));
+    // Safe to remove the op since it doesn't have any return value.
+    rewriter.eraseOp(op);
+    return success();
+  }
+};
+
+} // namespace
+
+namespace mlir::triton {
 
 void populateTritonGPUToLLVMPatterns(
     TritonGPUToLLVMTypeConverter &typeConverter, RewritePatternSet &patterns,
+    int numWarps, ModuleAxisInfoAnalysis &axisInfoAnalysis,
     ModuleAllocation &moduleAllocation,
     ConvertTritonGPUOpToLLVMPatternBase::IndexCacheInfo &indexCacheInfo,
     PatternBenefit benefit) {
@@ -626,14 +865,20 @@ void populateTritonGPUToLLVMPatterns(
                                         benefit);
   patterns.add<AsyncCommitGroupOpConversion>(typeConverter, benefit);
   patterns.add<AsyncWaitOpConversion>(typeConverter, benefit);
+  patterns.add<AsyncBulkCommitGroupOpConversion>(typeConverter, benefit);
+  patterns.add<AsyncBulkWaitOpConversion>(typeConverter, benefit);
   patterns.add<BroadcastOpConversion>(typeConverter, benefit);
-
   patterns.add<ExtractSliceOpConversion>(typeConverter, moduleAllocation,
                                          benefit);
   patterns.add<GetProgramIdOpConversion>(typeConverter, benefit);
   patterns.add<GetNumProgramsOpConversion>(typeConverter, benefit);
+  patterns.add<GetThreadIdOpConversion>(typeConverter, benefit);
+  patterns.add<GetCanonicalWarpIdConversion>(typeConverter, benefit);
+  patterns.add<GetClusterCTAIdOpConversion>(typeConverter, benefit);
   patterns.add<MakeRangeOpConversion>(typeConverter, indexCacheInfo, benefit);
   patterns.add<ReturnOpConversion>(typeConverter, benefit);
   patterns.add<PrintOpConversion>(typeConverter, benefit);
   patterns.add<AssertOpConversion>(typeConverter, benefit);
 }
+
+} // namespace mlir::triton

@@ -3,6 +3,7 @@
 
 #include "mlir/Analysis/DataFlowFramework.h"
 #include "mlir/Analysis/SliceAnalysis.h"
+#include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include <algorithm>
 #include <numeric>
@@ -35,7 +36,9 @@ public:
 
   triton::ReduceOp getOperation() { return op; }
 
-  bool isFastReduction();
+  bool isReductionOnLayoutFastAxis();
+
+  unsigned getThreadOffsetOnReductionAxis();
 
   bool isWarpSynchronous();
 
@@ -49,13 +52,17 @@ public:
 
   unsigned getThreadsReductionAxis();
 
-  SmallVector<unsigned> getScratchConfigBasic();
+  SmallVector<unsigned> getScratchConfig();
 
-  SmallVector<SmallVector<unsigned>> getScratchConfigsFast();
+  SmallVector<unsigned> getOrderWithAxisAtBeginning();
 
   unsigned getScratchSizeInBytes();
 
   bool isSupportedLayout();
+
+  bool isReduceWithinCTA();
+
+  unsigned getAxis() { return axis; }
 
 private:
   triton::ReduceOp op;
@@ -83,8 +90,12 @@ public:
   unsigned getNonAxisNumThreadsPerCTA();
   // Return the number of warps per CTA along axis dim.
   unsigned getAxisNumWarps();
+  // Return the number of warps per CTA along axis dim with unique data.
+  unsigned getAxisNumWarpsWithUniqueData();
   // Return the number of threads per warp along axis dim.
   unsigned getAxisNumThreadsPerWarp();
+  // Return the number of threads per warp along axis dim with unique data.
+  unsigned getAxisNumThreadsPerWarpWithUniqueData();
   // Return the number of blocks along axis dim.
   unsigned getAxisNumBlocks();
   // Return the number of blocks along non axis dim.
@@ -102,6 +113,7 @@ public:
   Location getLoc() { return scanOp.getLoc(); }
   unsigned getAxis() { return scanOp.getAxis(); }
   triton::gpu::BlockedEncodingAttr getEncoding();
+  llvm::ArrayRef<int64_t> getShape();
   Region &getCombineOp();
 
 private:
@@ -119,9 +131,17 @@ bool supportMMA(Value value, int version);
 
 bool isSingleValue(Value value);
 
-bool isMmaToDotShortcut(RankedTensorType &srcTy, RankedTensorType &dstTy);
+bool isMmaToDotShortcut(RankedTensorType srcTy, RankedTensorType dstTy);
 
-Type getElementType(Value value);
+bool isMmaToMmaShortcut(RankedTensorType srcTy, RankedTensorType dstTy);
+
+// Return true if the src and dst layout match.
+bool matchMmaV3AndDotOperandLayout(RankedTensorType srcTy,
+                                   RankedTensorType dstTy);
+
+// TODO: Move utility functions that belong to ConvertLayoutOp to class
+// ConvertLayoutOpHelper in the future
+bool shouldUseDistSmem(Attribute srcLayout, Attribute dstLayout);
 
 template <typename T_OUT, typename T_IN>
 inline SmallVector<T_OUT> convertType(ArrayRef<T_IN> in) {
@@ -324,6 +344,10 @@ protected:
   FuncDataMapT funcMap;
   SmallVector<FunctionOpInterface> roots;
 };
+// Create a basic DataFlowSolver with constant and dead code analysis included.
+std::unique_ptr<DataFlowSolver> createDataFlowSolver();
+
+triton::MakeTensorPtrOp getMakeTensorPtrOp(Value v);
 
 } // namespace mlir
 

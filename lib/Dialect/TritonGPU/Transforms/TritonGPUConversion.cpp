@@ -2,6 +2,7 @@
 #include "mlir/IR/IRMapping.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
+#include "triton/Dialect/TritonGPU/Transforms/Utility.h"
 #include <algorithm>
 #include <numeric>
 
@@ -12,26 +13,37 @@ using namespace mlir::triton::gpu;
 // TypeConverter
 //
 TritonGPUTypeConverter::TritonGPUTypeConverter(MLIRContext *context,
-                                               int numWarps, int threadsPerWarp)
-    : context(context), numWarps(numWarps), threadsPerWarp(threadsPerWarp) {
+                                               int numWarps, int threadsPerWarp,
+                                               int numCTAs)
+    : context(context), numWarps(numWarps), threadsPerWarp(threadsPerWarp),
+      numCTAs(numCTAs) {
   addConversion([](Type type) { return type; });
+
+  // Add encoding for tensor
   addConversion([this](RankedTensorType tensorType) -> RankedTensorType {
     // types with encoding are already in the right format
     // TODO: check for layout encodings more specifically
     if (tensorType.getEncoding())
       return tensorType;
-    // pessimistic values for attributes:
-    //   - 1 element per thread
-    //   - order = arange(rank)
     ArrayRef<int64_t> shape = tensorType.getShape();
-    int rank = shape.size();
-    llvm::SmallVector<unsigned> order(rank);
-    std::iota(order.begin(), order.end(), 0);
-    llvm::SmallVector<unsigned> sizePerThread(rank, 1);
-    Attribute encoding = triton::gpu::BlockedEncodingAttr::get(
-        this->context, shape, sizePerThread, order, this->numWarps,
-        this->threadsPerWarp);
+    triton::gpu::BlockedEncodingAttr encoding =
+        getDefaultBlockedEncoding(this->context, shape, this->numWarps,
+                                  this->threadsPerWarp, this->numCTAs);
     return RankedTensorType::get(shape, tensorType.getElementType(), encoding);
+  });
+
+  // Add encoding for tensor pointer
+  addConversion([this](triton::PointerType ptrType) -> triton::PointerType {
+    // Check whether tensor pointer `tt.ptr<tensor<>>`
+    auto pointeeTensorType =
+        ptrType.getPointeeType().dyn_cast<RankedTensorType>();
+    if (pointeeTensorType == nullptr)
+      return ptrType;
+
+    // Add layout into the tensor
+    auto convertedTensorType = convertType(pointeeTensorType);
+    return triton::PointerType::get(convertedTensorType,
+                                    ptrType.getAddressSpace());
   });
 
   //
@@ -80,8 +92,6 @@ TritonGPUConversionTarget::TritonGPUConversionTarget(
   // Some ops from SCF are illegal
   addIllegalOp<scf::ExecuteRegionOp, scf::ParallelOp, scf::ReduceOp,
                scf::ReduceReturnOp>();
-  // We have custom versions of some arith operators
-  addIllegalOp<arith::CmpIOp, arith::CmpFOp>();
 
   addDynamicallyLegalDialect<arith::ArithDialect, math::MathDialect,
                              triton::TritonDialect, cf::ControlFlowDialect,

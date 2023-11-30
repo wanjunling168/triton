@@ -69,19 +69,50 @@ getThreadsPerWarpWithUniqueData(Attribute layout,
 SmallVector<unsigned>
 getWarpsPerCTAWithUniqueData(Attribute layout, ArrayRef<int64_t> tensorShape);
 
-SmallVector<unsigned> getThreadsPerCTA(Attribute layout);
-
-SmallVector<unsigned>
-getShapePerCTA(Attribute layout,
-               ArrayRef<int64_t> tensorShape = ArrayRef<int64_t>());
-
 SmallVector<unsigned> getOrder(Attribute layout);
+
+CTALayoutAttr getCTALayout(Attribute layout);
+
+SmallVector<unsigned> getCTAsPerCGA(Attribute layout);
+
+SmallVector<unsigned> getCTASplitNum(Attribute layout);
+
+SmallVector<unsigned> getCTAOrder(Attribute layout);
+
+/* The difference between ShapePerCTATile and ShapePerCTA:
+ * (1) ShapePerCTATile is defined by SizePerThread * ThreadsPerWarp *
+ *     WarpsPerCTA in each dimension and is independent from the tensor shape.
+ * (2) ShapePerCTA is defined by shape / CTASplitNum in each dimension.
+ * (3) In the implementation of emitIndices, ShapePerCTATile will
+ *     be replicated or wraped to fit ShapePerCTA.
+ */
+SmallVector<unsigned>
+getShapePerCTATile(Attribute layout,
+                   ArrayRef<int64_t> tensorShape = ArrayRef<int64_t>());
+
+SmallVector<int64_t> getShapePerCTA(ArrayRef<unsigned> CTASplitNum,
+                                    ArrayRef<int64_t> shape);
+SmallVector<int64_t> getShapePerCTA(Attribute layout, ArrayRef<int64_t> shape);
+SmallVector<int64_t> getShapePerCTA(Type type);
+
+unsigned getNumWarpsPerCTA(Attribute layout);
+
+unsigned getNumCTAs(Attribute layout);
 
 bool isaDistributedLayout(Attribute layout);
 
-bool isSharedEncoding(Value value);
+bool hasSharedEncoding(Value value);
 
-bool isExpensiveCat(CatOp cat, Attribute &targetEncoding);
+bool isExpensiveCat(CatOp cat, Attribute targetEncoding);
+
+// Return true if a view between the two types cannot be implemented as a no-op.
+bool isExpensiveView(Type srcType, Type dstType);
+
+// Return a blocked encoding where the shape is distributed contiguously amonsgt
+// the threads, warps, CTAs with 1 element per threads.
+triton::gpu::BlockedEncodingAttr
+getDefaultBlockedEncoding(MLIRContext *context, ArrayRef<int64_t> shape,
+                          int numWarps, int threadsPerWarp, int numCTAs);
 
 } // namespace gpu
 } // namespace triton

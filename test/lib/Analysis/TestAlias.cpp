@@ -20,7 +20,7 @@ struct TestAliasPass
     return opName;
   }
 
-  static void print(StringRef name, SmallVector<std::string, 4> &vals,
+  static void print(StringRef name, SmallVector<std::string> &vals,
                     raw_ostream &os) {
     if (vals.empty())
       return;
@@ -57,7 +57,7 @@ struct TestAliasPass
     auto getAllocOpNames = [&](Value value) {
       dataflow::Lattice<AliasInfo> *latticeElement =
           analysis->getLatticeElement(value);
-      SmallVector<std::string, 4> opNames;
+      SmallVector<std::string> opNames;
       if (latticeElement) {
         auto &info = latticeElement->getValue();
         for (auto &alias : info.getAllocs()) {
@@ -87,7 +87,7 @@ struct TestAliasPass
       }
       if (auto forOp = dyn_cast<scf::ForOp>(op)) {
         for (auto arg : llvm::enumerate(forOp.getRegionIterArgs())) {
-          auto operand = forOp.getOpOperandForRegionIterArg(arg.value()).get();
+          auto operand = forOp.getTiedLoopInit(arg.value())->get();
           auto opNames = getAllocOpNames(operand);
           auto argName = getValueOperandName(arg.value(), state);
           print(argName, opNames, os);

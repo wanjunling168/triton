@@ -6,9 +6,11 @@ include "triton/Dialect/Triton/IR/TritonTypes.td"
 include "triton/Dialect/Triton/IR/TritonAttrDefs.td"
 include "triton/Dialect/Triton/IR/TritonInterfaces.td"
 include "mlir/IR/OpBase.td"
-include "mlir/IR/FunctionInterfaces.td" // FunctionOpInterface
 include "mlir/IR/SymbolInterfaces.td" // SymbolUserOpInterface
 include "mlir/IR/OpAsmInterface.td" // OpAsmOpInterface
+include "mlir/Interfaces/CallInterfaces.td" // CallOpInterface
+include "mlir/Interfaces/CastInterfaces.td" // CastOpInterface
+include "mlir/Interfaces/FunctionInterfaces.td" // FunctionOpInterface
 include "mlir/Interfaces/SideEffectInterfaces.td" // Pure
 include "mlir/Interfaces/ControlFlowInterfaces.td" // BranchOpInterface
 include "mlir/Interfaces/InferTypeOpInterface.td" // SameOperandsAndResultType
@@ -20,7 +22,8 @@ include "mlir/Interfaces/CallInterfaces.td" // CallOpInterface
 // Op Base
 //
 class TT_Op<string mnemonic, list<Trait> traits = []> :
-    Op<Triton_Dialect, mnemonic, !listconcat(traits, [TensorSizeTrait])> {
+    Op<Triton_Dialect, mnemonic,
+       !listconcat(traits, [TensorSizeTrait, VerifyTensorLayoutsTrait])> {
 }
 
 //
@@ -135,7 +138,7 @@ def TT_LoadOp : TT_Op<"load",
                       [SameLoadStoreOperandsAndResultShape,
                        SameLoadStoreOperandsAndResultEncoding,
                        AttrSizedOperandSegments,
-                       MemoryEffects<[MemRead]>,
+                       DeclareOpInterfaceMethods<MemoryEffectsOpInterface>,
                        TypesMatchWith<"infer ptr type from result type",
                                       "result", "ptr", "$_self",
                                       "mlir::OpTrait::impl::verifyLoadStorePointerAndValueType">,
@@ -240,7 +243,7 @@ def TT_AtomicRMWOp : TT_Op<"atomic_rmw", [SameOperandsAndResultShape,
 
     let arguments = (ins TT_AtomicRMWAttr:$atomic_rmw_op, TT_PtrLike:$ptr,
                          TT_Type:$val, Optional<TT_BoolLike>:$mask,
-                         TT_MemSemanticAttr:$sem);
+                         TT_MemSemanticAttr:$sem, TT_MemSyncScopeAttr:$scope);
 
     let results = (outs TT_Type:$result);
 }
@@ -262,7 +265,7 @@ def TT_AtomicCASOp : TT_Op<"atomic_cas", [MemoryEffects<[MemRead]>,
     }];
 
     let arguments = (ins TT_PtrLike:$ptr, TT_Type:$cmp, TT_Type:$val,
-                     TT_MemSemanticAttr:$sem);
+                     TT_MemSemanticAttr:$sem, TT_MemSyncScopeAttr:$scope);
 
     let results = (outs TT_Type:$result);
 }
@@ -299,19 +302,15 @@ def TT_ExpandDimsOp : TT_Op<"expand_dims", [Pure,
     let hasFolder = 1;
 }
 
-// view is not `pure` because it may reorder elements
-def TT_ViewOp : TT_Op<"view", [NoMemoryEffect,
-                               SameOperandsAndResultElementType]> {
-    let summary = "view";
-
-    let arguments = (ins TT_Tensor:$src);
-
+def TT_ReshapeOp : TT_Op<"reshape", [Pure,
+                                     SameOperandsAndResultElementType]> {
+    let summary = "reinterpret a tensor to a different shape. It may change elements order if the attribute is set.";
+    let arguments = (ins TT_Tensor:$src, BoolAttr:$allow_reorder);
     let results = (outs TT_Tensor:$result);
-
-    let assemblyFormat = "$src attr-dict `:` functional-type(operands, results)";
-
+    let assemblyFormat = "$src attr-dict `:` type($src) `->` type($result)";
     let hasCanonicalizeMethod = 1;
     let hasFolder = 1;
+    let hasVerifier = 1;
 }
 
 def TT_BroadcastOp : TT_Op<"broadcast", [Pure,
@@ -392,7 +391,12 @@ def TT_DotOp : TT_Op<"dot", [Pure,
         $d = matrix_multiply($a, $b) + $c
     }];
 
-    let arguments = (ins TT_FpIntTensor:$a, TT_FpIntTensor:$b, TT_FpIntTensor:$c, BoolAttr:$allowTF32);
+    let arguments = (ins
+      TT_FpIntTensor:$a,
+      TT_FpIntTensor:$b,
+      TT_FpIntTensor:$c,
+      BoolAttr:$allowTF32,
+      I32Attr:$maxNumImpreciseAcc);
 
     let results = (outs TT_FpIntTensor:$d);
 
@@ -461,37 +465,26 @@ def TT_ScanReturnOp: TT_Op<"scan.return",
 //
 // External Elementwise op
 //
-class TT_ExternElementwiseOpBase<string mnemonic, list<Trait> traits = []> :
-    TT_Op<mnemonic,
-         traits # [Elementwise,
-                   SameOperandsAndResultEncoding,
-                   SameVariadicOperandSize]> {
+def TT_ExternElementwiseOp : TT_Op<"extern_elementwise", [Elementwise,
+                                                            SameOperandsAndResultEncoding,
+                                                            SameVariadicOperandSize,
+                                                            DeclareOpInterfaceMethods<MemoryEffectsOpInterface>]> {
 
     let description = [{
         call an external function $symbol implemented in $libpath/$libname with $args
         return $libpath/$libname:$symbol($args...)
     }];
 
-    let arguments = (ins Variadic<TT_Type>:$args, StrAttr:$libname, StrAttr:$libpath, StrAttr:$symbol);
+    let arguments = (ins Variadic<TT_Type>:$args, StrAttr:$libname, StrAttr:$libpath, StrAttr:$symbol, BoolAttr:$pure);
 
     let results = (outs TT_Type:$result);
 
     let assemblyFormat = "operands attr-dict `:` functional-type(operands, $result)";
 }
 
-def TT_PureExternElementwiseOp : TT_ExternElementwiseOpBase<"pure_extern_elementwise", [Pure, Elementwise]> {
-    let summary = "FFI for pure element-wise extern LLVM bitcode functions";
-}
-
-def TT_ImpureExternElementwiseOp : TT_ExternElementwiseOpBase<"impure_extern_elementwise", [MemoryEffects<[MemRead]>,
-                                                                                            MemoryEffects<[MemWrite]>]> {
-    let summary = "FFI for impure element-wise extern LLVM bitcode functions";
-}
-
 //
 // Make Range Op
 //
-// TODO: should have ConstantLike as Trait
 def TT_MakeRangeOp : TT_Op<"make_range", [Pure]> {
     let summary = "make range";
 
@@ -501,11 +494,40 @@ def TT_MakeRangeOp : TT_Op<"make_range", [Pure]> {
         Values span from $start to $end (exclusive), with step = 1
     }];
 
+    // WARNING: MLIR generates getStart()/getEnd() functions which return
+    // uint32_t, even though these arguments are to be interpreted as *signed*
+    // int32 values.  If this matters, use get{Start,End}Attr().getInt(), which
+    // return int64_t.
     let arguments = (ins I32Attr:$start, I32Attr:$end);
 
     let results = (outs TT_IntTensor:$result);
 
     let assemblyFormat = "attr-dict `:` type($result)";
+
+    let hasFolder = 1;
+    let hasVerifier = 1;
+}
+
+//
+// ElementwiseInlineAsm Op
+//
+def TT_ElementwiseInlineAsmOp : TT_Op<"elementwise_inline_asm", [Elementwise,
+                                                                 SameOperandsAndResultEncoding,
+                                                                 DeclareOpInterfaceMethods<MemoryEffectsOpInterface>]> {
+  let summary = "inline assembly applying elementwise operation to a group of packed element.";
+  let description = [{
+   This will apply the given in inline assembly to `packed_element` number of
+   elements of the inputs. The elements packed together is unknown and will
+   depend on the backend implementation.
+  }];
+
+  let arguments = (ins StrAttr:$asm_string, StrAttr:$constraints, BoolAttr:$pure, I32Attr:$packed_element, Variadic<AnyTypeOf<[TT_Type]>>:$args);
+  let results = (outs TT_Type:$result);
+
+
+  let assemblyFormat = [{
+    $asm_string attr-dict ($args^ `:` type($args))? `->` type($result)
+  }];
 }
 
 //
@@ -563,6 +585,7 @@ def TT_MakeTensorPtrOp : TT_Op<"make_tensor_ptr",
 
   let results = (outs TT_TensorPtr:$result);
 
+  // TODO(Keren): define a custom assembly format for this op because the result type cannot be printed correctly
   // Add additional `[]` to increase readability and split variadic lists
   let assemblyFormat = "$base `,` `[` $shape `]` `,` `[` $strides `]` `,` `[` $offsets `]` attr-dict `:` type($result)";
 
@@ -646,6 +669,12 @@ def CallOp : TT_Op<"call", [CallOpInterface, /*MemRefsNormalizable, */DeclareOpI
     void setCalleeFromCallable(CallInterfaceCallable callee) {
       (*this)->setAttr("callee", callee.get<SymbolRefAttr>());
     }
+
+    // Required by CallOpInterface.
+    MutableOperandRange getArgOperandsMutable() {
+      return getOperandsMutable();
+    }
+
   }];
 
   let assemblyFormat = [{

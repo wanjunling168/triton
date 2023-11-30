@@ -1,4 +1,8 @@
-﻿#include "mlir/IR/Builders.h"
+﻿#include <mutex>
+#include <stack>
+#include <unordered_map>
+
+#include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/MLIRContext.h"
 #include "mlir/IR/Verifier.h"
@@ -19,15 +23,19 @@
 #include "mlir/Dialect/Index/IR/IndexOps.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "triton/Analysis/Allocation.h"
+#include "triton/Conversion/NVGPUToLLVM/NVGPUToLLVMPass.h"
 #include "triton/Conversion/TritonGPUToLLVM/TritonGPUToLLVMPass.h"
 #include "triton/Conversion/TritonToTritonGPU/TritonToTritonGPUPass.h"
+#include "triton/Dialect/NVGPU/IR/Dialect.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/Triton/IR/Types.h"
 #include "triton/Dialect/Triton/Transforms/Passes.h"
 #include "triton/Dialect/TritonGPU/Transforms/Passes.h"
-#include "triton/Target/HSACO/HSACOTranslation.h"
+#include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
+#include "triton/Dialect/TritonNvidiaGPU/Transforms/Passes.h"
 #include "triton/Target/LLVMIR/LLVMIRTranslation.h"
 #include "triton/Target/PTX/PTXTranslation.h"
+#include "triton/Target/PTX/TmaMetadata.h"
 #include "triton/Tools/Sys/GetEnv.hpp"
 #include "triton/Tools/Sys/GetPlatform.hpp"
 
@@ -45,6 +53,7 @@
 #include <fstream>
 #include <optional>
 #include <pybind11/buffer_info.h>
+#include <pybind11/embed.h>
 #include <pybind11/functional.h>
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
@@ -55,7 +64,10 @@
 #include <stdexcept>
 #include <string>
 
+#include <pybind11/numpy.h>
 namespace py = pybind11;
+
+PYBIND11_MAKE_OPAQUE(mlir::triton::gpu::TMAMetadataTy);
 
 enum backend_t {
   HOST,
@@ -69,6 +81,11 @@ void init_triton_runtime(py::module &&m) {
       .value("HOST", HOST)
       .value("CUDA", CUDA)
       .value("ROCM", ROCM)
+      .export_values();
+
+  py::enum_<mlir::triton::Target>(m, "TARGET")
+      .value("NVVM", mlir::triton::NVVM)
+      .value("ROCDL", mlir::triton::ROCDL)
       .export_values();
 }
 
@@ -156,6 +173,21 @@ private:
   bool lineInfoEnabled = !triton::tools::getBoolEnv("TRITON_DISABLE_LINE_INFO");
 };
 
+static std::string locationToString(mlir::Location loc) {
+  std::string str;
+  llvm::raw_string_ostream os(str);
+  loc.print(os);
+  os.flush(); // Make sure all the content is dumped into the 'str' string
+  return str;
+}
+
+static void outputWarning(mlir::Location loc, const std::string &msg) {
+  std::string locStr = locationToString(loc);
+
+  PyErr_WarnEx(PyExc_UserWarning, (locStr + ": " + msg).c_str(),
+               /*stack_level=*/2);
+}
+
 /*****************************************************************************/
 /* Python bindings for triton::ir                                            */
 /*****************************************************************************/
@@ -187,6 +219,12 @@ void init_triton_ir(py::module &&m) {
       .value("RELAXED", mlir::triton::MemSemantic::RELAXED)
       .export_values();
 
+  py::enum_<mlir::triton::MemSyncScope>(m, "MEM_SYNC_SCOPE", py::module_local())
+      .value("GPU", mlir::triton::MemSyncScope::GPU)
+      .value("CTA", mlir::triton::MemSyncScope::CTA)
+      .value("SYSTEM", mlir::triton::MemSyncScope::SYSTEM)
+      .export_values();
+
   py::enum_<mlir::triton::EvictionPolicy>(m, "EVICTION_POLICY",
                                           py::module_local())
       .value("NORMAL", mlir::triton::EvictionPolicy::NORMAL)
@@ -216,6 +254,7 @@ void init_triton_ir(py::module &&m) {
         // we load LLVM because the frontend uses LLVM.undef for
         // some placeholders
         self.getOrLoadDialect<mlir::LLVM::LLVMDialect>();
+        self.getOrLoadDialect<mlir::tensor::TensorDialect>();
       });
   // .def(py::init([](){
   //   mlir::MLIRContext context;
@@ -513,9 +552,11 @@ void init_triton_ir(py::module &&m) {
         mlir::DialectRegistry registry;
         registry.insert<
             mlir::triton::TritonDialect, mlir::triton::gpu::TritonGPUDialect,
-            mlir::math::MathDialect, mlir::arith::ArithDialect,
-            mlir::index::IndexDialect, mlir::scf::SCFDialect,
-            mlir::cf::ControlFlowDialect, mlir::LLVM::LLVMDialect>();
+            mlir::triton::nvidia_gpu::TritonNvidiaGPUDialect,
+            mlir::triton::nvgpu::NVGPUDialect, mlir::math::MathDialect,
+            mlir::arith::ArithDialect, mlir::index::IndexDialect,
+            mlir::scf::SCFDialect, mlir::cf::ControlFlowDialect,
+            mlir::LLVM::LLVMDialect>();
         context.appendDialectRegistry(registry);
         context.loadAllAvailableDialects();
 
@@ -577,6 +618,17 @@ void init_triton_ir(py::module &&m) {
                  auto *newBlock = block->splitBlock(pos);
                  newBlock->erase();
                }
+             });
+             // 2. Check if the result of tl.advance is used
+             self.walk([&](mlir::Operation *op) {
+               if (mlir::isa<mlir::triton::AdvanceOp>(op) &&
+                   op->getResult(0).use_empty())
+                 outputWarning(op->getLoc(), "The result of tl.advance is not "
+                                             "being used. Note that tl.advance "
+                                             "does not have any side effects. "
+                                             "To move the block pointer, you "
+                                             "need to assign the result of "
+                                             "tl.advance to a variable.");
              });
            })
       .def_property_readonly("type", &mlir::triton::FuncOp::getFunctionType)
@@ -742,7 +794,7 @@ void init_triton_ir(py::module &&m) {
            [](TritonOpBuilder &self) -> mlir::Type {
              return self.getBuilder().getI64Type();
            })
-      .def("get_fp8e4_ty",
+      .def("get_fp8e4nv_ty",
            [](TritonOpBuilder &self) -> mlir::Type {
              return self.getBuilder().getType<mlir::Float8E4M3FNUZType>();
            })
@@ -751,6 +803,12 @@ void init_triton_ir(py::module &&m) {
              // TODO: upstream FP8E4B15 into MLIR, or find a way to externally
              // have a float-like type compatible with float only native ops
              return self.getBuilder().getType<mlir::Float8E4M3B11FNUZType>();
+           })
+      .def("get_fp8e4b15x4_ty",
+           [](TritonOpBuilder &self) -> mlir::Type {
+             // TODO: upstream FP8E4B15 into MLIR, or find a way to externally
+             // have a float-like type compatible with float only native ops
+             return self.getBuilder().getType<mlir::Float8E4M3FNType>();
            })
       .def("get_fp8e5_ty",
            [](TritonOpBuilder &self) -> mlir::Type {
@@ -1053,6 +1111,36 @@ void init_triton_ir(py::module &&m) {
               mlir::Value &rhs) -> mlir::Value {
              return mlir::Value(self.create<mlir::arith::ShRSIOp>(lhs, rhs));
            })
+      .def("create_minsi",
+           [](TritonOpBuilder &self, mlir::Value &lhs,
+              mlir::Value &rhs) -> mlir::Value {
+             return mlir::Value(self.create<mlir::arith::MinSIOp>(lhs, rhs));
+           })
+      .def("create_minui",
+           [](TritonOpBuilder &self, mlir::Value &lhs,
+              mlir::Value &rhs) -> mlir::Value {
+             return mlir::Value(self.create<mlir::arith::MinUIOp>(lhs, rhs));
+           })
+      .def("create_minf",
+           [](TritonOpBuilder &self, mlir::Value &lhs,
+              mlir::Value &rhs) -> mlir::Value {
+             return mlir::Value(self.create<mlir::arith::MinimumFOp>(lhs, rhs));
+           })
+      .def("create_maxsi",
+           [](TritonOpBuilder &self, mlir::Value &lhs,
+              mlir::Value &rhs) -> mlir::Value {
+             return mlir::Value(self.create<mlir::arith::MaxSIOp>(lhs, rhs));
+           })
+      .def("create_maxui",
+           [](TritonOpBuilder &self, mlir::Value &lhs,
+              mlir::Value &rhs) -> mlir::Value {
+             return mlir::Value(self.create<mlir::arith::MaxUIOp>(lhs, rhs));
+           })
+      .def("create_maxf",
+           [](TritonOpBuilder &self, mlir::Value &lhs,
+              mlir::Value &rhs) -> mlir::Value {
+             return mlir::Value(self.create<mlir::arith::MaximumFOp>(lhs, rhs));
+           })
       // AddPtr (similar to GEP)
       .def("create_addptr",
            [](TritonOpBuilder &self, mlir::Value &ptr,
@@ -1262,14 +1350,14 @@ void init_triton_ir(py::module &&m) {
              self.create<mlir::triton::StoreOp>(ptrs, val, mask, cacheModifier,
                                                 evictionPolicy);
            })
-      .def("create_view",
+      .def("create_reshape",
            [](TritonOpBuilder &self, mlir::Value &arg,
-              std::vector<int64_t> &shape) -> mlir::Value {
-             auto argType = arg.getType()
-                                .dyn_cast<mlir::RankedTensorType>()
-                                .getElementType();
-             return self.create<mlir::triton::ViewOp>(
-                 mlir::RankedTensorType::get(shape, argType), arg);
+              std::vector<int64_t> &shape, bool allowReorder) -> mlir::Value {
+             auto argType =
+                 arg.getType().cast<mlir::RankedTensorType>().getElementType();
+             return self.create<mlir::triton::ReshapeOp>(
+                 mlir::RankedTensorType::get(shape, argType), arg,
+                 allowReorder);
            })
       .def(
           "create_expand_dims",
@@ -1327,7 +1415,8 @@ void init_triton_ir(py::module &&m) {
       // // atomic
       .def("create_atomic_cas",
            [](TritonOpBuilder &self, mlir::Value &ptr, mlir::Value &cmp,
-              mlir::Value &val, mlir::triton::MemSemantic sem) -> mlir::Value {
+              mlir::Value &val, mlir::triton::MemSemantic sem,
+              mlir::triton::MemSyncScope scope) -> mlir::Value {
              mlir::Type dstType;
              if (auto srcTensorType =
                      ptr.getType().dyn_cast<mlir::RankedTensorType>()) {
@@ -1342,12 +1431,13 @@ void init_triton_ir(py::module &&m) {
                dstType = ptrType.getPointeeType();
              }
              return self.create<mlir::triton::AtomicCASOp>(dstType, ptr, cmp,
-                                                           val, sem);
+                                                           val, sem, scope);
            })
       .def("create_atomic_rmw",
            [](TritonOpBuilder &self, mlir::triton::RMWOp rmwOp,
               mlir::Value &ptr, mlir::Value &val, mlir::Value &mask,
-              mlir::triton::MemSemantic sem) -> mlir::Value {
+              mlir::triton::MemSemantic sem,
+              mlir::triton::MemSyncScope scope) -> mlir::Value {
              mlir::Type dstType;
              if (auto srcTensorType =
                      ptr.getType().dyn_cast<mlir::RankedTensorType>()) {
@@ -1361,8 +1451,8 @@ void init_triton_ir(py::module &&m) {
                                   .cast<mlir::triton::PointerType>();
                dstType = ptrType.getPointeeType();
              }
-             return self.create<mlir::triton::AtomicRMWOp>(dstType, rmwOp, ptr,
-                                                           val, mask, sem);
+             return self.create<mlir::triton::AtomicRMWOp>(
+                 dstType, rmwOp, ptr, val, mask, sem, scope);
            })
       // External
       .def("create_extern_elementwise",
@@ -1370,12 +1460,8 @@ void init_triton_ir(py::module &&m) {
               const std::string &libPath, const std::string &symbol,
               std::vector<mlir::Value> &argList, mlir::Type retType,
               bool isPure) -> mlir::Value {
-             if (isPure)
-               return self.create<mlir::triton::PureExternElementwiseOp>(
-                   retType, argList, libName, libPath, symbol);
-             else
-               return self.create<mlir::triton::ImpureExternElementwiseOp>(
-                   retType, argList, libName, libPath, symbol);
+             return self.create<mlir::triton::ExternElementwiseOp>(
+                 retType, argList, libName, libPath, symbol, isPure);
            })
       // Built-in instruction
       .def("create_get_program_id",
@@ -1396,9 +1482,10 @@ void init_triton_ir(py::module &&m) {
            })
       .def("create_dot",
            [](TritonOpBuilder &self, mlir::Value &a, mlir::Value &b,
-              mlir::Value &c, bool allowTF32) -> mlir::Value {
-             return self.create<mlir::triton::DotOp>(c.getType(), a, b, c,
-                                                     allowTF32);
+              mlir::Value &c, bool allowTF32,
+              int maxNumImpreciseAcc) -> mlir::Value {
+             return self.create<mlir::triton::DotOp>(
+                 c.getType(), a, b, c, allowTF32, maxNumImpreciseAcc);
            })
       .def("create_exp",
            [](TritonOpBuilder &self, mlir::Value &val) -> mlir::Value {
@@ -1469,6 +1556,14 @@ void init_triton_ir(py::module &&m) {
               mlir::Value &trueValue, mlir::Value &falseValue) -> mlir::Value {
              return self.create<mlir::arith::SelectOp>(condition, trueValue,
                                                        falseValue);
+           })
+      .def("create_inline_asm",
+           [](TritonOpBuilder &self, const std::string &inlineAsm,
+              const std::string &constraints,
+              const std::vector<mlir::Value> &values, mlir::Type &type,
+              bool isPure, int pack) -> mlir::Value {
+             return self.create<mlir::triton::ElementwiseInlineAsmOp>(
+                 type, inlineAsm, constraints, isPure, pack, values);
            })
       .def("create_print",
            [](TritonOpBuilder &self, const std::string &prefix,
@@ -1550,9 +1645,18 @@ void init_triton_ir(py::module &&m) {
       .def(
           "add_sccp_pass",
           [](mlir::PassManager &self) { self.addPass(mlir::createSCCPPass()); })
+      .def("add_plan_cta_pass",
+           [](mlir::PassManager &self,
+              mlir::triton::nvidia_gpu::ClusterInfo &clusterInfo) {
+             self.addPass(mlir::createTritonNvidiaGPUPlanCTAPass(&clusterInfo));
+           })
       .def("add_tritongpu_coalesce_pass",
            [](mlir::PassManager &self) {
              self.addPass(mlir::createTritonGPUCoalescePass());
+           })
+      .def("add_tritongpu_optimize_thread_locality_pass",
+           [](mlir::PassManager &self) {
+             self.addPass(mlir::createTritonGPUOptimizeThreadLocalityPass());
            })
       .def("add_symbol_dce_pass",
            [](mlir::PassManager &self) {
@@ -1581,20 +1685,59 @@ void init_triton_ir(py::module &&m) {
              self.addPass(mlir::triton::createReorderBroadcastPass());
            })
       .def("add_rewrite_tensor_pointer_pass",
+           [](mlir::PassManager &self, int capability) {
+             self.addPass(
+                 mlir::triton::createRewriteTensorPointerPass(capability));
+           })
+      .def("add_tritongpu_ws_feasibility_checking_pass",
            [](mlir::PassManager &self, int computeCapability) {
-             self.addPass(mlir::triton::createRewriteTensorPointerPass(
+             self.addPass(mlir::createTritonNvidiaGPUWSFeasibilityCheckingPass(
                  computeCapability));
+           })
+      .def("add_tritongpu_wsdecomposing_pass",
+           [](mlir::PassManager &self, int computeCapability) {
+             self.addPass(mlir::createTritonNvidiaGPUWSDecomposingPass(
+                 computeCapability));
+           })
+      .def("add_tritongpu_wspipeline_pass",
+           [](mlir::PassManager &self, int numStages, int numWarps,
+              int computeCapability) {
+             self.addPass(mlir::createTritonNvidiaGPUWSPipelinePass(
+                 numStages, numWarps, computeCapability));
+           })
+      .def("add_tritongpu_wsmutex_pass",
+           [](mlir::PassManager &self, int computeCapability) {
+             self.addPass(
+                 mlir::createTritonNvidiaGPUWSMutexPass(computeCapability));
+           })
+      .def("add_tritongpu_wsmaterialization_pass",
+           [](mlir::PassManager &self, int computeCapability) {
+             self.addPass(mlir::createTritonNvidiaGPUWSMaterializationPass(
+                 computeCapability));
+           })
+      .def("add_tritongpu_ws_fixup_missing_attrs_pass",
+           [](mlir::PassManager &self) {
+             self.addPass(mlir::createTritonNvidiaGPUWSFixupMissingAttrs());
            })
       .def(
           "add_convert_triton_to_tritongpu_pass",
-          [](mlir::PassManager &self, int numWarps, int threadsPerWarp) {
+          [](mlir::PassManager &self, int numWarps, int threadsPerWarp,
+             int numCTAs, int computeCapability) {
             self.addPass(mlir::triton::createConvertTritonToTritonGPUPass(
-                numWarps, threadsPerWarp));
+                numWarps, threadsPerWarp, numCTAs, computeCapability));
           },
-          py::arg("numWarps") = 4, py::arg("threadsPerWarp") = 32)
+          py::arg("numWarps") = 4, py::arg("threadsPerWarp") = 32,
+          py::arg("numCTAs") = 1, py::arg("computeCapability") = 80)
       .def("add_tritongpu_pipeline_pass",
-           [](mlir::PassManager &self, int numStages) {
-             self.addPass(mlir::createTritonGPUPipelinePass(numStages));
+           [](mlir::PassManager &self, int numStages, int numWarps, int numCTAs,
+              int computeCapability) {
+             self.addPass(mlir::createTritonGPUPipelinePass(
+                 numStages, numWarps, numCTAs, computeCapability));
+           })
+      .def("add_tritongpu_materialize_load_store_pass",
+           [](mlir::PassManager &self, int numWarps, int computeCapability) {
+             self.addPass(mlir::createTritonNvidiaGPUMaterializeLoadStorePass(
+                 numWarps, computeCapability));
            })
       .def("add_tritongpu_prefetch_pass",
            [](mlir::PassManager &self) {
@@ -1617,34 +1760,113 @@ void init_triton_ir(py::module &&m) {
            [](mlir::PassManager &self) {
              self.addPass(mlir::createTritonGPUReorderInstructionsPass());
            })
+      .def("add_tritongpu_rewrite_tensor_pointer_pass",
+           [](mlir::PassManager &self, int capability) {
+             self.addPass(
+                 mlir::createTritonGPURewriteTensorPointerPass(capability));
+           })
       .def("add_tritongpu_decompose_conversions_pass",
            [](mlir::PassManager &self) {
              self.addPass(mlir::createTritonGPUDecomposeConversionsPass());
+           })
+      .def("add_tritongpu_fence_insertion_pass",
+           [](mlir::PassManager &self) {
+             self.addPass(mlir::createTritonNvidiaGPUFenceInsertionPass());
            })
       .def("add_triton_gpu_to_llvm",
            [](mlir::PassManager &self) {
              self.addPass(mlir::triton::createConvertTritonGPUToLLVMPass());
            })
+      .def("add_nv_gpu_to_llvm",
+           [](mlir::PassManager &self) {
+             self.addPass(mlir::triton::createConvertNVGPUToLLVMPass());
+           })
       .def("add_scf_to_cfg", [](mlir::PassManager &self) {
         self.addPass(mlir::createConvertSCFToCFPass());
       });
+
+  m.def("is_ws_supported", [](mlir::ModuleOp &mod) -> bool {
+    return mlir::triton::nvidia_gpu::TritonNvidiaGPUDialect::getWSSupportedAttr(
+        mod);
+  });
+}
+
+void init_triton_env_vars(py::module &m) {
+  m.def("get_env_vars", []() -> std::map<std::string, bool> {
+    std::map<std::string, bool> envVars;
+    for (const auto &envVar : triton::ENV_VARS) {
+      envVars[envVar] = triton::tools::getBoolEnv(envVar);
+    }
+    return envVars;
+  });
 }
 
 void init_triton_translation(py::module &m) {
   using ret = py::return_value_policy;
 
+  py::class_<mlir::triton::nvidia_gpu::ClusterInfo>(m, "ClusterInfo")
+      .def(py::init<>())
+      .def_readwrite("clusterDimX",
+                     &mlir::triton::nvidia_gpu::ClusterInfo::clusterDimX)
+      .def_readwrite("clusterDimY",
+                     &mlir::triton::nvidia_gpu::ClusterInfo::clusterDimY)
+      .def_readwrite("clusterDimZ",
+                     &mlir::triton::nvidia_gpu::ClusterInfo::clusterDimZ)
+      .def("__repr__", [](mlir::triton::nvidia_gpu::ClusterInfo &self) {
+        std::ostringstream oss;
+        oss << "(" << self.clusterDimX << ", " << self.clusterDimY << ", "
+            << self.clusterDimZ << ")";
+        return oss.str();
+      });
+
+  py::class_<mlir::triton::gpu::TMAInfo>(m, "TMAInfo")
+      .def(py::init<>())
+      .def_readwrite("tensorDataType",
+                     &mlir::triton::gpu::TMAInfo::tensorDataType)
+      .def_readwrite("tensorRank", &mlir::triton::gpu::TMAInfo::tensorRank)
+      .def_readwrite("globalAddressArgIdx",
+                     &mlir::triton::gpu::TMAInfo::globalAddressArgIdx)
+      .def_readwrite("globalStridesArgIdx",
+                     &mlir::triton::gpu::TMAInfo::globalStridesArgIdx)
+      .def_readwrite("globalDimsArgIdx",
+                     &mlir::triton::gpu::TMAInfo::globalDimsArgIdx)
+      .def_readwrite("boxDims", &mlir::triton::gpu::TMAInfo::boxDims)
+      .def_readwrite("elementStrides",
+                     &mlir::triton::gpu::TMAInfo::elementStrides)
+      .def_readwrite("interleave", &mlir::triton::gpu::TMAInfo::interleave)
+      .def_readwrite("swizzle", &mlir::triton::gpu::TMAInfo::swizzle)
+      .def_readwrite("l2Promotion", &mlir::triton::gpu::TMAInfo::l2Promotion)
+      .def_readwrite("oobFill", &mlir::triton::gpu::TMAInfo::oobFill)
+      .def_readwrite("TMADescArgIdx",
+                     &mlir::triton::gpu::TMAInfo::TMADescArgIdx);
+  py::bind_vector<std::vector<mlir::triton::gpu::TMAInfo>>(m, "TMAInfos");
+
   m.def("get_shared_memory_size", [](mlir::ModuleOp mod) {
     auto shared = mod->getAttrOfType<mlir::IntegerAttr>("triton_gpu.shared");
     return shared.getInt();
   });
+  m.def("get_num_warps", [](mlir::ModuleOp mod) {
+    auto shared = mod->getAttrOfType<mlir::IntegerAttr>("triton_gpu.num-warps");
+    assert(shared);
+    int num_warps = shared.getInt();
+
+    if (auto attr = mod->getAttrOfType<mlir::IntegerAttr>(
+            "triton_gpu.num-warp-groups-per-cta")) {
+      num_warps *= attr.getInt();
+    }
+
+    return num_warps;
+  });
 
   m.def(
       "translate_triton_gpu_to_llvmir",
-      [](mlir::ModuleOp op, int computeCapability, bool isROCM) {
+      [](mlir::ModuleOp op, int computeCapability,
+         mlir::triton::gpu::TMAMetadataTy &tmaInfos,
+         mlir::triton::Target target) {
         py::gil_scoped_release allow_threads;
         llvm::LLVMContext llvmContext;
         auto llvmModule = ::mlir::triton::translateTritonGPUToLLVMIR(
-            &llvmContext, op, computeCapability, isROCM);
+            &llvmContext, op, computeCapability, tmaInfos, target);
         if (!llvmModule)
           llvm::report_fatal_error("Failed to translate TritonGPU to LLVM IR.");
 
@@ -1658,7 +1880,8 @@ void init_triton_translation(py::module &m) {
 
   m.def(
       "translate_llvmir_to_ptx",
-      [](const std::string llvmIR, int capability, int version) -> std::string {
+      [](const std::string llvmIR, int capability, int version,
+         bool enable_fp_fusion) -> std::string {
         py::gil_scoped_release allow_threads;
         // create LLVM module from C++
         llvm::LLVMContext context;
@@ -1673,105 +1896,131 @@ void init_triton_translation(py::module &m) {
               "lineno: " + std::to_string(error.getLineNo()));
         }
         // translate module to PTX
-        auto ptxCode =
-            triton::translateLLVMIRToPTX(*module, capability, version);
+        auto ptxCode = triton::translateLLVMIRToPTX(*module, capability,
+                                                    version, enable_fp_fusion);
         return ptxCode;
       },
       ret::take_ownership);
 
-  m.def(
-      "compile_ptx_to_cubin",
-      [](const std::string &ptxCode, const std::string &ptxasPath,
-         int capability) -> py::object {
-        std::string cubin;
-        {
-          py::gil_scoped_release allow_threads;
+  m.def("compile_ptx_to_cubin",
+        [](const std::string &ptxCode, const std::string &ptxasPath,
+           int capability, bool enable_fp_fusion) -> py::object {
+          std::string cubin;
+          {
+            py::gil_scoped_release allow_threads;
 
-          // compile ptx with ptxas
-          llvm::SmallString<64> fsrc;
-          llvm::SmallString<64> flog;
-          llvm::sys::fs::createTemporaryFile("compile-ptx-src", "", fsrc);
-          llvm::sys::fs::createTemporaryFile("compile-ptx-log", "", flog);
-          std::string fbin = std::string(fsrc) + ".o";
-          llvm::FileRemover logRemover(flog);
-          llvm::FileRemover binRemover(fbin);
-          const char *_fsrc = fsrc.c_str();
-          const char *_flog = flog.c_str();
-          const char *_fbin = fbin.c_str();
-          std::ofstream ofs(_fsrc);
-          ofs << ptxCode << std::endl;
-          ofs.close();
+            // compile ptx with ptxas
+            llvm::SmallString<64> fsrc;
+            llvm::SmallString<64> flog;
+            llvm::sys::fs::createTemporaryFile("compile-ptx-src", "", fsrc);
+            llvm::sys::fs::createTemporaryFile("compile-ptx-log", "", flog);
+            std::string fbin = std::string(fsrc) + ".o";
+            llvm::FileRemover logRemover(flog);
+            llvm::FileRemover binRemover(fbin);
+            const char *_fsrc = fsrc.c_str();
+            const char *_flog = flog.c_str();
+            const char *_fbin = fbin.c_str();
+            std::ofstream ofs(_fsrc);
+            ofs << ptxCode << std::endl;
+            ofs.close();
 
-          auto lineInfoOption =
-              triton::tools::getBoolEnv("TRITON_DISABLE_LINE_INFO")
-                  ? ""
-                  : " -lineinfo";
-          auto capabilitySuffix = (capability == 90) ? "a " : " ";
-          auto outputFileName = std::string(_fsrc) + ".o";
-          auto logRedirect = " 2> " + std::string(_flog);
-          std::string cmd = ptxasPath + lineInfoOption + " -v --gpu-name=sm_" +
-                            std::to_string(capability) + capabilitySuffix +
-                            _fsrc + " -o " + outputFileName + logRedirect;
+            auto lineInfoOption =
+                triton::tools::getBoolEnv("TRITON_DISABLE_LINE_INFO")
+                    ? ""
+                    : " -lineinfo";
+            auto fmadOption = enable_fp_fusion ? "" : " --fmad=false";
+            auto capabilitySuffix = (capability == 90) ? "a " : " ";
+            auto outputFileName = std::string(_fsrc) + ".o";
+            auto logRedirect = " 2> " + std::string(_flog);
+            std::string cmd = ptxasPath + lineInfoOption + fmadOption +
+                              " -v --gpu-name=sm_" +
+                              std::to_string(capability) + capabilitySuffix +
+                              _fsrc + " -o " + outputFileName + logRedirect;
 
-          int err = system(cmd.c_str());
-          if (err != 0) {
-            err >>= 8;
-            std::ifstream _log(_flog);
-            std::string log(std::istreambuf_iterator<char>(_log), {});
-            if (err == 255) {
-              throw std::runtime_error("Internal Triton PTX codegen error: \n" +
-                                       log);
-            } else if (err == 128 + SIGSEGV) {
-              throw std::runtime_error("Please run `ptxas " + fsrc.str().str() +
-                                       "` to confirm that this is a "
-                                       "bug in `ptxas`\n" +
-                                       log);
+            int err = system(cmd.c_str());
+            if (err != 0) {
+              err >>= 8;
+              std::ifstream _log(_flog);
+              std::string log(std::istreambuf_iterator<char>(_log), {});
+              if (err == 255) {
+                throw std::runtime_error(
+                    "Internal Triton PTX codegen error: \n" + log);
+              } else if (err == 128 + SIGSEGV) {
+                throw std::runtime_error("Please run `ptxas " +
+                                         fsrc.str().str() +
+                                         "` to confirm that this is a "
+                                         "bug in `ptxas`\n" +
+                                         log);
+              } else {
+                throw std::runtime_error("`ptxas` failed with error code " +
+                                         std::to_string(err) + ": \n" + log);
+              }
+              return {};
             } else {
-              throw std::runtime_error("`ptxas` failed with error code " +
-                                       std::to_string(err) + ": \n" + log);
+              llvm::FileRemover srcRemover(fsrc);
+              std::ifstream _cubin(_fbin, std::ios::binary);
+              cubin = std::string(std::istreambuf_iterator<char>(_cubin), {});
+              _cubin.close();
+              // Do not return here, exit the gil scope and return below
             }
-            return {};
-          } else {
-            llvm::FileRemover srcRemover(fsrc);
-            std::ifstream _cubin(_fbin, std::ios::binary);
-            cubin = std::string(std::istreambuf_iterator<char>(_cubin), {});
-            _cubin.close();
-            // Do not return here, exit the gil scope and return below
           }
-        }
-        py::bytes bytes(cubin);
-        return std::move(bytes);
-      });
+          py::bytes bytes(cubin);
+          return std::move(bytes);
+        });
 
   m.def("add_external_libs",
         [](mlir::ModuleOp &op, const std::vector<std::string> &names,
            const std::vector<std::string> &paths) {
           ::mlir::triton::addExternalLibs(op, names, paths);
         });
+}
 
-  m.def(
-      "translate_llvmir_to_hsaco",
-      [](const std::string llvmIR, std::string gfx_arch, std::string gfx_triple,
-         std::string gfx_features) -> std::tuple<std::string, std::string> {
-        // create LLVM module from C++
-        llvm::LLVMContext context;
-        std::unique_ptr<llvm::MemoryBuffer> buffer =
-            llvm::MemoryBuffer::getMemBuffer(llvmIR.c_str());
-        llvm::SMDiagnostic error;
-        std::unique_ptr<llvm::Module> module =
-            llvm::parseIR(buffer->getMemBufferRef(), error, context);
-        // translate module to HSACO
-        auto hsacoCode = triton::translateLLVMIRToHSACO(
-            *module, gfx_arch, gfx_triple, gfx_features);
-        return hsacoCode;
-      },
-      ret::take_ownership);
+void init_triton_interpreter(py::module &&m) {
+  using ret = py::return_value_policy;
+
+  m.def("load",
+        [](py::array_t<uint64_t> ptrs, py::array_t<bool> masks, py::array other,
+           py::dtype ret_dtype) -> py::array {
+          int numel = ptrs.size();
+          auto shape =
+              std::vector<ptrdiff_t>(ptrs.shape(), ptrs.shape() + ptrs.ndim());
+          py::array ret(ret_dtype, py::array::ShapeContainer{numel});
+          py::array_t<uint64_t> reshaped_ptrs = ptrs.reshape({numel});
+          py::array_t<bool> reshaped_masks = masks.reshape({numel});
+          py::array reshaped_others = other.reshape({numel});
+          for (size_t i = 0; i < ptrs.size(); ++i) {
+            if (reshaped_masks.at(i))
+              memcpy(ret.mutable_data(i),
+                     reinterpret_cast<void *>(reshaped_ptrs.at(i)),
+                     ret_dtype.itemsize());
+            else
+              memcpy(ret.mutable_data(i), reshaped_others.data(i),
+                     ret_dtype.itemsize());
+          }
+          return ret.reshape(shape);
+        });
+
+  m.def("store", [](py::array_t<uint64_t> ptrs, py::array values,
+                    py::array_t<bool> mask) {
+    int numel = ptrs.size();
+    py::array_t<uint64_t> reshaped_ptrs = ptrs.reshape({numel});
+    py::array_t<int8_t> reshaped_masks = mask.reshape({numel});
+    py::array reshaped_values = values.reshape({numel});
+    for (size_t i = 0; i < ptrs.size(); ++i) {
+      if (reshaped_masks.at(i)) {
+        memcpy(reinterpret_cast<void *>(reshaped_ptrs.mutable_at(i)),
+               reshaped_values.data(i), values.dtype().itemsize());
+      }
+    }
+  });
 }
 
 void init_triton(py::module &m) {
   py::module subm = m.def_submodule("triton");
+  init_triton_env_vars(subm);
   // init_triton_codegen(subm.def_submodule("code_gen"));
   init_triton_runtime(subm.def_submodule("runtime"));
   init_triton_ir(subm.def_submodule("ir"));
+  init_triton_interpreter(subm.def_submodule("interpreter"));
   init_triton_translation(subm);
 }
